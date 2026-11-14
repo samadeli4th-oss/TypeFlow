@@ -1,4 +1,4 @@
-# layout-hint
+# Smart Keyboard
 
 Shows a small hint when you type a word with the wrong keyboard layout, English ⇄ Persian, on Windows.
 
@@ -46,8 +46,8 @@ Only one copy can run at a time.
 - **Right click**: menu with **Hints on**, **Auto-fix when sure** (convert without asking; off by
   default), **Sound** (the ding), **Start with Windows** (on by default), and **Exit**
 
-Settings are saved to `%APPDATA%\layout-hint\settings.ini` whenever you change them, and you can
-also edit that file by hand. **Start with Windows** adds `layout-hint` under
+Settings are saved to `%APPDATA%\Smart Keyboard\settings.ini` whenever you change them, and you can
+also edit that file by hand. **Start with Windows** adds `Smart Keyboard` under
 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`, pointing at the exe you ran. If you move the
 exe, start it once from the new place and the entry follows. Debug builds never touch that entry.
 
@@ -68,6 +68,11 @@ rustup toolchain install stable-x86_64-pc-windows-gnu
 cargo +stable-x86_64-pc-windows-gnu test
 cargo +stable-x86_64-pc-windows-gnu run --release
 ```
+
+The app is `target\release\smart-keyboard.exe`, a single file with everything built in.
+
+Smart Keyboard was first called *layout-hint*. On first start it takes over settings saved under
+`%APPDATA%\layout-hint\` and replaces the old `layout-hint` Start with Windows entry.
 
 In Git Bash, Git's own `link` command can shadow the MSVC linker; build from `cmd` or PowerShell.
 
@@ -106,7 +111,7 @@ code.
 
 ## Acknowledgements
 
-layout-hint is a Rust port of **[ZabanYar](https://github.com/shyguy2018/ZabanYar)** by
+Smart Keyboard is a Rust port of **[ZabanYar](https://github.com/shyguy2018/ZabanYar)** by
 **Behrooz Shayestepoor** (MIT). The detection approach and thresholds, the fallback key map, the
 test cases and the overall design of the key tracker come from ZabanYar. Thank you!
 

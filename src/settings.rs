@@ -1,6 +1,6 @@
 //! Settings saved between runs, and the "Start with Windows" registry entry.
 //!
-//! File: `%APPDATA%\layout-hint\settings.ini`, plain `key=value` lines:
+//! File: `%APPDATA%\Smart Keyboard\settings.ini`, plain `key=value` lines:
 //!
 //! ```text
 //! enabled=true
@@ -55,21 +55,27 @@ impl Settings {
 
     pub fn to_text(&self) -> String {
         format!(
-            "# layout-hint settings (also changed from the tray menu)\n\
+            "# Smart Keyboard settings (also changed from the tray menu)\n\
              enabled={}\nauto_fix={}\nsound={}\nstart_with_windows={}\n",
             self.enabled, self.auto_fix, self.sound, self.start_with_windows
         )
     }
 }
 
-fn path() -> Option<PathBuf> {
-    std::env::var_os("APPDATA").map(|dir| PathBuf::from(dir).join("layout-hint").join("settings.ini"))
+fn settings_file(app_folder: &str) -> Option<PathBuf> {
+    std::env::var_os("APPDATA").map(|dir| PathBuf::from(dir).join(app_folder).join("settings.ini"))
 }
 
-/// Loads the saved settings, or the defaults if there is no file yet.
+fn path() -> Option<PathBuf> {
+    settings_file("Smart Keyboard")
+}
+
+/// Loads the saved settings. With no file yet, takes over the settings saved
+/// under the app's old name (layout-hint), else uses the defaults.
 pub fn load() -> Settings {
     path()
         .and_then(|p| std::fs::read_to_string(p).ok())
+        .or_else(|| settings_file("layout-hint").and_then(|p| std::fs::read_to_string(p).ok()))
         .map(|text| Settings::parse(&text))
         .unwrap_or_default()
 }
@@ -91,13 +97,16 @@ pub mod autostart {
     use windows::Win32::System::Registry::*;
 
     const RUN_KEY: PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
-    const VALUE: PCWSTR = w!("layout-hint");
+    const VALUE: PCWSTR = w!("Smart Keyboard");
+    /// The entry written under the app's old name.
+    const OLD_VALUE: PCWSTR = w!("layout-hint");
 
-    /// Adds or removes `HKCU\...\Run\layout-hint`. When adding, it points at the
+    /// Adds or removes `HKCU\...\Run\Smart Keyboard`. When adding, it points at the
     /// exe that is running now, so moving the exe and starting it once fixes
-    /// the entry.
+    /// the entry. Any entry from the old name is removed.
     pub fn set(on: bool) {
         unsafe {
+            let _ = RegDeleteKeyValueW(HKEY_CURRENT_USER, RUN_KEY, OLD_VALUE);
             if on {
                 let Ok(exe) = std::env::current_exe() else { return };
                 let command: Vec<u16> = format!("\"{}\"", exe.display()).encode_utf16().chain([0]).collect();

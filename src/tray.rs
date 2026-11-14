@@ -73,7 +73,7 @@ fn notify_data(window: HWND, icon: HICON) -> NOTIFYICONDATAW {
         hIcon: icon,
         ..Default::default()
     };
-    let tip = if get(&ENABLED) { "layout-hint: on" } else { "layout-hint: off" };
+    let tip = if get(&ENABLED) { "Smart Keyboard: on" } else { "Smart Keyboard: off" };
     for (i, unit) in tip.encode_utf16().take(data.szTip.len() - 1).enumerate() {
         data.szTip[i] = unit;
     }
@@ -121,7 +121,7 @@ pub fn show_menu(window: HWND) -> usize {
             let _ = AppendMenuW(menu, flags, id, text);
         };
         let check = |flag: &AtomicBool| if get(flag) { MF_CHECKED } else { MF_UNCHECKED };
-        item(MF_STRING | MF_GRAYED, 0, w!("layout-hint  ·  English ⇄ فارسی"));
+        item(MF_STRING | MF_GRAYED, 0, w!("Smart Keyboard  ·  English ⇄ فارسی"));
         item(MF_SEPARATOR, 0, PCWSTR::null());
         item(MF_STRING | check(&ENABLED), CMD_ENABLED, w!("Hints on"));
         item(MF_STRING | check(&AUTO_FIX), CMD_AUTO_FIX, w!("Auto-fix when sure"));

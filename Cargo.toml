@@ -1,5 +1,5 @@
 [package]
-name = "layout-hint"
+name = "smart-keyboard"
 version = "0.1.0"
 edition = "2021"
 description = "Shows a hint when a word was typed with the wrong keyboard layout (English <-> Persian) on Windows."
