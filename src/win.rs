@@ -128,6 +128,8 @@ thread_local! {
     /// The hidden window that owns the tray icon.
     static TRAY_WINDOW: std::cell::Cell<isize> = const { std::cell::Cell::new(0) };
     static TASKBAR_CREATED: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// Sent by the installer to close a running copy before updating or removing it.
+    static EXIT_REQUEST: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
 fn with_state<R>(f: impl FnOnce(&mut State) -> R) -> Option<R> {
@@ -926,6 +928,10 @@ unsafe extern "system" fn window_proc(window: HWND, msg: u32, wparam: WPARAM, lp
             }
             return LRESULT(0);
         }
+        if msg != 0 && msg == EXIT_REQUEST.with(|t| t.get()) {
+            tray_command(window, tray::CMD_EXIT);
+            return LRESULT(0);
+        }
         if msg != 0 && msg == TASKBAR_CREATED.with(|t| t.get()) {
             tray::add(window); // Explorer restarted: put the icon back
             return LRESULT(0);
@@ -1021,6 +1027,7 @@ pub fn run() -> Result<()> {
         )?;
         TRAY_WINDOW.with(|t| t.set(tray_window.0 as isize));
         TASKBAR_CREATED.with(|t| t.set(RegisterWindowMessageW(w!("TaskbarCreated"))));
+        EXIT_REQUEST.with(|t| t.set(RegisterWindowMessageW(w!("TypeFlow.Exit"))));
         tray::add(tray_window);
 
         let (en_hkl, fa_hkl) = installed_layouts();

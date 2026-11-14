@@ -10,7 +10,25 @@ Shows a small hint when you type a word with the wrong keyboard layout, English 
 
 Real words in the layout you're using are left alone.
 
-> **Status:** early. It runs from the tray and has no installer yet.
+> **Status:** early. It runs from the tray.
+
+## Install
+
+Run `TypeFlow-Setup-<version>.exe`. It installs TypeFlow for your user only, so no admin rights
+are needed:
+
+- the app goes to `%LOCALAPPDATA%\Programs\TypeFlow\`, with a Start menu shortcut;
+- if the English or Persian keyboard is missing, it offers to add it (the same as adding the
+  language in Settings);
+- it starts TypeFlow, which adds itself to Start with Windows;
+- an update closes the running copy first and keeps your settings.
+
+The exe isn't signed, so Windows SmartScreen may warn about an unknown publisher: **More info** →
+**Run anyway**. To remove TypeFlow, use Settings → Apps → Installed apps → TypeFlow → Uninstall;
+your settings in `%APPDATA%\TypeFlow\` are kept.
+
+For scripted installs, `TypeFlow-Setup-<version>.exe /S` installs without questions (and leaves
+the keyboards alone), and `%LOCALAPPDATA%\Programs\TypeFlow\uninstall.exe /uninstall /S` removes it.
 
 ## Use
 
@@ -69,7 +87,19 @@ cargo +stable-x86_64-pc-windows-gnu test
 cargo +stable-x86_64-pc-windows-gnu run --release
 ```
 
-The app is `target\release	ypeflow.exe`, a single file with everything built in.
+The app is `target\release\typeflow.exe` (or `target\gnu\release\typeflow.exe` with the GNU
+toolchain), a single file with everything built in.
+
+### Installer
+
+```bat
+powershell -ExecutionPolicy Bypass -File tools\build-installer.ps1
+powershell -ExecutionPolicy Bypass -File tools\build-installer.ps1 -Gnu
+```
+
+(the second line uses the GNU toolchain). This builds the release app and then
+[`installer/`](installer/), and writes `dist\TypeFlow-Setup-<version>.exe`: one file with the app
+inside, nothing else to download. See [Install](#install) for what it does.
 
 TypeFlow was earlier called *Smart Keyboard* and, before that, *layout-hint*. On first start it
 takes over settings saved under `%APPDATA%\Smart Keyboard\` (or `%APPDATA%\layout-hint\`) and
