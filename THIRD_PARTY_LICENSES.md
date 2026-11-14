@@ -2,7 +2,7 @@
 
 ## ZabanYar
 
-Smart Keyboard is a Rust port of parts of [ZabanYar](https://github.com/shyguy2018/ZabanYar)
+TypeFlow is a Rust port of parts of [ZabanYar](https://github.com/shyguy2018/ZabanYar)
 by Behrooz Shayestepoor:
 
 - `src/detect.rs`: detection logic, thresholds and test cases (from `core.py`, `tests/test_core.py`)
@@ -45,24 +45,22 @@ for what was changed.
 
 ## Fonts
 
-Both fonts are embedded in the exe and registered privately for the app only
+The Persian font is embedded in the exe and registered privately for the app only
 (`AddFontMemResourceEx`); nothing is installed on the system.
 
 | File | Font | Source | License |
 |---|---|---|---|
-| `assets/fonts/UbuntuSansCondensed-Light.ttf` | Ubuntu Sans Condensed Light, © 2011, 2022, 2023 Canonical Ltd. | [canonical/Ubuntu-Sans-fonts](https://github.com/canonical/Ubuntu-Sans-fonts) | Ubuntu Font Licence 1.0, see [assets/fonts/UbuntuSans-LICENCE.txt](assets/fonts/UbuntuSans-LICENCE.txt) |
 | `assets/fonts/Vazirmatn-RD-Light.ttf` | Vazirmatn RD (Round Dots) Light, © 2015 The Vazirmatn Project Authors | [rastikerdar/vazirmatn](https://github.com/rastikerdar/vazirmatn) | SIL Open Font License 1.1, see [assets/fonts/Vazirmatn-OFL.txt](assets/fonts/Vazirmatn-OFL.txt) |
 
-The font files are unmodified.
+The font file is unmodified. English text uses Segoe UI, which ships with Windows and is not bundled.
 
 ## Notification sound
 
-`assets/sounds/notification.wav` is "New Notification 07" by **Universfield**
-(file `universfield-new-notification-07-210334.mp3`, as distributed on
-[Pixabay](https://pixabay.com/users/universfield-28281460/)), used under the
-[Pixabay Content License](https://pixabay.com/service/license-summary/).
-Changes: trimmed to 0.095–0.95 s with a short fade-out, converted to 16-bit
-44.1 kHz mono WAV.
+`assets/sounds/notification.wav` is "Notification Alert Warning" from
+**[Tunetank](https://tunetank.com)** (file `tunetank.com_notification-alert-warning.wav`, © 2023),
+used under the Tunetank license (TODO: confirm the license terms and any attribution they ask for).
+Changes: trimmed to 0–1.81 s with a 0.1 s fade-out, mixed down to 16-bit 44.1 kHz mono WAV, tags
+removed.
 
 ## windows-rs
 

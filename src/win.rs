@@ -33,6 +33,7 @@ use windows::Win32::System::Threading::CreateMutexW;
 use crate::detect::{self, Confidence, Lang};
 use crate::mapping;
 use crate::settings;
+use crate::theme;
 use crate::tray;
 
 // ------------------------------------------------------------------ settings ---
@@ -122,7 +123,7 @@ enum Action {
 thread_local! {
     static STATE: RefCell<Option<State>> = const { RefCell::new(None) };
     /// What the bubble paints: (suggestion, is_persian).
-    static BUBBLE_TEXT: RefCell<(String, bool)> = const { RefCell::new((String::new(), false)) };
+    static BUBBLE_TEXT: RefCell<(String, bool, theme::Theme)> = const { RefCell::new((String::new(), false, theme::Theme::DEFAULT)) };
     static FONTS: RefCell<Option<Fonts>> = const { RefCell::new(None) };
     /// The hidden window that owns the tray icon.
     static TRAY_WINDOW: std::cell::Cell<isize> = const { std::cell::Cell::new(0) };
@@ -607,23 +608,23 @@ unsafe extern "system" fn mouse_hook(code: i32, wparam: WPARAM, lparam: LPARAM) 
 }
 
 // -------------------------------------------------------------------- bubble ---
-const BG: COLORREF = COLORREF(0x0031_2D2B); // 0x00BBGGRR
-const FG: COLORREF = COLORREF(0x00FF_FFFF);
-const MUTED: COLORREF = COLORREF(0x00B0_A8A0);
-const PAD: i32 = 12;
-/// Space between the two labels on the first row.
-const GAP: i32 = 24;
-const LABEL_FA: &str = "منظورتون این بود؟";
-const LABEL_EN: &str = "Tab ✓   Esc ×";
+// A one-line glass pill holding only the suggestion; colors follow Windows
+// (theme.rs). Sizes are at 96 DPI.
+const HEIGHT: i32 = 32;
+const PAD: i32 = 14;
+/// Longer phrases end in "…".
+const MAX_WIDTH: i32 = 420;
+const FA_PX: i32 = 18;
+const EN_PX: i32 = 15;
 
-// Fonts bundled into the exe and registered privately for this process
-// (see assets/fonts/ and THIRD_PARTY_LICENSES.md).
-const FONT_FILES: [&[u8]; 2] = [
-    include_bytes!("../assets/fonts/UbuntuSansCondensed-Light.ttf"),
-    include_bytes!("../assets/fonts/Vazirmatn-RD-Light.ttf"),
-];
-pub const EN_FONT: PCWSTR = w!("Ubuntu Sans Condensed Light");
+// The Persian font is bundled into the exe and registered privately for this
+// process (see assets/fonts/ and THIRD_PARTY_LICENSES.md).
+const FONT_FILES: [&[u8]; 1] = [include_bytes!("../assets/fonts/Vazirmatn-RD-Light.ttf")];
 pub const FA_FONT: PCWSTR = w!("Vazirmatn RD Light");
+/// English uses the Windows 11 UI font (Semilight sits well next to
+/// Vazirmatn Light), and Segoe UI on Windows 10. GDI face names stop at 31
+/// characters, hence "Semiligh".
+const EN_FONTS: [PCWSTR; 2] = [w!("Segoe UI Variable Text Semiligh"), w!("Segoe UI Semilight")];
 
 fn load_fonts() {
     for data in FONT_FILES {
@@ -635,19 +636,23 @@ fn load_fonts() {
 }
 
 struct Fonts {
-    label_fa: HFONT,
-    label_en: HFONT,
-    main_fa: HFONT,
-    main_en: HFONT,
+    fa: HFONT,
+    en: HFONT,
+    dpi: i32,
 }
 
 impl Fonts {
     fn main(&self, rtl: bool) -> HFONT {
-        if rtl { self.main_fa } else { self.main_en }
+        if rtl { self.fa } else { self.en }
+    }
+
+    /// 96-DPI pixels to device pixels.
+    fn px(&self, v: i32) -> i32 {
+        v * self.dpi / 96
     }
 }
 
-/// "New Notification 07" by Universfield, trimmed and converted to 16-bit
+/// "Notification Alert Warning" from Tunetank, trimmed and converted to 16-bit
 /// mono WAV (see assets/sounds/ and THIRD_PARTY_LICENSES.md).
 static DING_WAV: &[u8] = include_bytes!("../assets/sounds/notification.wav");
 
@@ -664,16 +669,30 @@ fn with_fonts<R>(f: impl FnOnce(&Fonts) -> R) -> R {
         let mut slot = cell.borrow_mut();
         let fonts = slot.get_or_insert_with(|| unsafe {
             let dpi = GetDpiForSystem() as i32;
-            let make = |pt: i32, face: PCWSTR| {
-                CreateFontW(-(pt * dpi / 72), 0, 0, 0, 400, 0, 0, 0, DEFAULT_CHARSET.0 as u32,
-                    OUT_DEFAULT_PRECIS.0 as u32, CLIP_DEFAULT_PRECIS.0 as u32, CLEARTYPE_QUALITY.0 as u32, 0, face)
+            // grayscale antialiasing: the text is turned into alpha over the glass
+            let make = |px: i32, face: PCWSTR| {
+                CreateFontW(-(px * dpi / 96), 0, 0, 0, 400, 0, 0, 0, DEFAULT_CHARSET.0 as u32,
+                    OUT_DEFAULT_PRECIS.0 as u32, CLIP_DEFAULT_PRECIS.0 as u32, ANTIALIASED_QUALITY.0 as u32, 0, face)
             };
-            Fonts {
-                label_fa: make(10, FA_FONT),
-                label_en: make(10, EN_FONT),
-                main_fa: make(17, FA_FONT),
-                main_en: make(18, EN_FONT),
+            // GDI silently substitutes a missing face; take the first one that exists
+            let dc = CreateCompatibleDC(None);
+            let mut en = HFONT::default();
+            for face in EN_FONTS {
+                en = make(EN_PX, face);
+                let old = SelectObject(dc, en);
+                let mut buf = [0u16; 64];
+                GetTextFaceW(dc, Some(&mut buf));
+                let n = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+                SelectObject(dc, old);
+                if String::from_utf16_lossy(&buf[..n]).eq_ignore_ascii_case(&face.to_string().unwrap_or_default()) {
+                    break;
+                }
+                if face != EN_FONTS[EN_FONTS.len() - 1] {
+                    let _ = DeleteObject(en);
+                }
             }
+            let _ = DeleteDC(dc);
+            Fonts { fa: make(FA_PX, FA_FONT), en, dpi }
         });
         f(fonts)
     })
@@ -706,12 +725,11 @@ fn line_flags(rtl: bool) -> DRAW_TEXT_FORMAT {
 
 fn show_bubble(window: HWND, text: &str, target: Lang, start: usize) {
     let rtl = target == Lang::Fa;
-    BUBBLE_TEXT.with(|b| *b.borrow_mut() = (text.to_string(), rtl));
+    let theme = theme::Theme::current();
+    BUBBLE_TEXT.with(|b| *b.borrow_mut() = (text.to_string(), rtl, theme));
+    theme::apply(window, &theme);
     unsafe {
-        // row 1 = "Tab ✓ Esc ×" (left) + Persian label (right), row 2 = suggestion
-        let hdc = GetDC(window);
-        let (width, height) = measure_bubble(hdc, text, rtl);
-        ReleaseDC(window, hdc);
+        let (width, height) = bubble_size(text, rtl);
         // A growing bubble keeps the caret position it first appeared at, so
         // it doesn't jump around; only its size changes.
         let existing = with_state(|s| s.bubble.as_ref().map(|b| b.caret)).flatten();
@@ -722,9 +740,10 @@ fn show_bubble(window: HWND, text: &str, target: Lang, start: usize) {
         if existing.is_none() {
             ding();
         }
+        // corners are rounded by DWM (theme::apply), not a window region,
+        // which would clip the glass
         let _ = SetWindowPos(window, HWND_TOPMOST, x, y, width, height, SWP_NOACTIVATE | SWP_SHOWWINDOW);
-        SetWindowRgn(window, CreateRoundRectRgn(0, 0, width + 1, height + 1, 12, 12), true);
-        let _ = InvalidateRect(window, None, true);
+        let _ = InvalidateRect(window, None, false);
         SetTimer(window, TIMER_HIDE, BUBBLE_MS, None);
 
         let rect = RECT { left: x, top: y, right: x + width, bottom: y + height };
@@ -745,40 +764,86 @@ unsafe fn paint(window: HWND) {
     let hdc = BeginPaint(window, &mut ps);
     let mut client = RECT::default();
     let _ = GetClientRect(window, &mut client);
-    let (text, rtl) = BUBBLE_TEXT.with(|b| b.borrow().clone());
-    draw_bubble(hdc, client, &text, rtl);
+    let (text, rtl, theme) = BUBBLE_TEXT.with(|b| b.borrow().clone());
+    let (w, h, pixels) = render_bubble(&text, rtl, &theme.colors());
+    if w == client.right && h == client.bottom {
+        SetDIBitsToDevice(hdc, 0, 0, w as u32, h as u32, 0, 0, 0, h as u32,
+            pixels.as_ptr() as *const _, &dib_info(w, h), DIB_RGB_COLORS);
+    }
     let _ = EndPaint(window, &ps);
 }
 
-/// Size the bubble needs for `text`.
-unsafe fn measure_bubble(hdc: HDC, text: &str, rtl: bool) -> (i32, i32) {
+/// Size the bubble needs for `text`: one 32 px line, at most 420 px wide.
+unsafe fn bubble_size(text: &str, rtl: bool) -> (i32, i32) {
     with_fonts(|f| {
-        let (fa_w, fa_h) = text_size(hdc, f.label_fa, LABEL_FA, true);
-        let (en_w, en_h) = text_size(hdc, f.label_en, LABEL_EN, false);
-        let (main_w, main_h) = text_size(hdc, f.main(rtl), text, rtl);
-        ((en_w + GAP + fa_w).max(main_w) + 2 * PAD, fa_h.max(en_h) + main_h + 2 * PAD + 2)
+        let dc = CreateCompatibleDC(None);
+        let (w, _) = text_size(dc, f.main(rtl), text, rtl);
+        let _ = DeleteDC(dc);
+        ((w + 2 * f.px(PAD)).min(f.px(MAX_WIDTH)), f.px(HEIGHT))
     })
 }
 
-unsafe fn draw_bubble(hdc: HDC, client: RECT, text: &str, rtl: bool) {
-    let brush = CreateSolidBrush(BG);
-    FillRect(hdc, &client, brush);
-    let _ = DeleteObject(brush);
+fn dib_info(w: i32, h: i32) -> BITMAPINFO {
+    BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: w,
+            biHeight: -h, // top-down
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB.0,
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
 
-    SetBkMode(hdc, TRANSPARENT);
-    let inner = RECT { left: PAD, top: PAD, right: client.right - PAD, bottom: client.bottom - PAD };
-
-    with_fonts(|f| {
-        SetTextColor(hdc, MUTED);
-        let mut r = inner;
-        text_line(hdc, f.label_en, LABEL_EN, &mut r, DT_LEFT | DT_TOP);
-        let mut r = inner;
-        text_line(hdc, f.label_fa, LABEL_FA, &mut r, DT_RTLREADING | DT_RIGHT | DT_TOP);
-
-        SetTextColor(hdc, FG);
-        let mut r = inner;
-        text_line(hdc, f.main(rtl), text, &mut r, line_flags(rtl) | DT_BOTTOM);
+/// The bubble as premultiplied ARGB pixels. GDI can't draw text with alpha,
+/// so the text is drawn white on black, its grey levels are used as coverage,
+/// and it is composited here over the fill. With glass on the fill's alpha is
+/// 0 in the pixels (the tint is in the acrylic itself, see theme.rs), so DWM
+/// shows the blurred backdrop through everything but the letters.
+unsafe fn render_bubble(text: &str, rtl: bool, c: &theme::Colors) -> (i32, i32, Vec<u32>) {
+    let (w, h) = bubble_size(text, rtl);
+    let coverage = with_fonts(|f| {
+        let screen = GetDC(None);
+        let dc = CreateCompatibleDC(screen);
+        let bmp = CreateCompatibleBitmap(screen, w, h);
+        let old = SelectObject(dc, bmp);
+        let mut rect = RECT { left: 0, top: 0, right: w, bottom: h };
+        FillRect(dc, &rect, HBRUSH(GetStockObject(BLACK_BRUSH).0));
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, COLORREF(0x00FF_FFFF));
+        rect.left = f.px(PAD);
+        rect.right = w - f.px(PAD);
+        if rtl {
+            rect.top = f.px(1); // Vazirmatn's tall ascent sits it a little high
+        }
+        text_line(dc, f.main(rtl), text, &mut rect, line_flags(rtl) | DT_VCENTER | DT_END_ELLIPSIS);
+        SelectObject(dc, old);
+        let mut px = vec![0u32; (w * h) as usize];
+        GetDIBits(dc, bmp, 0, h as u32, Some(px.as_mut_ptr() as *mut _), &mut dib_info(w, h), DIB_RGB_COLORS);
+        let _ = DeleteObject(bmp);
+        let _ = DeleteDC(dc);
+        ReleaseDC(None, screen);
+        px
     });
+
+    // solid fill only when transparency effects are off
+    let fill_a = if c.fill_alpha == 255 { 1.0 } else { 0.0 };
+    let channel = |text: u8, fill: u8, cov: f64| (text as f64 * cov + fill as f64 * fill_a * (1.0 - cov)).round() as u32;
+    let pixels = coverage
+        .iter()
+        .map(|p| {
+            let cov = ((p >> 8) & 0xFF) as f64 / 255.0;
+            let a = (255.0 * cov + 255.0 * fill_a * (1.0 - cov)).round() as u32;
+            a << 24
+                | channel(c.text.0, c.fill.0, cov) << 16
+                | channel(c.text.1, c.fill.1, cov) << 8
+                | channel(c.text.2, c.fill.2, cov)
+        })
+        .collect();
+    (w, h, pixels)
 }
 
 // -------------------------------------------------------------- window proc ---
@@ -910,10 +975,10 @@ unsafe extern "system" fn window_proc(window: HWND, msg: u32, wparam: WPARAM, lp
 pub fn run() -> Result<()> {
     unsafe {
         // only one copy at a time: two keyboard hooks would fight each other
-        let _mutex = CreateMutexW(None, true, w!("Local\\SmartKeyboard-single-instance"))?;
+        let _mutex = CreateMutexW(None, true, w!("Local\\TypeFlow-single-instance"))?;
         if GetLastError() == ERROR_ALREADY_EXISTS {
-            MessageBoxW(None, w!("Smart Keyboard is already running. Look for its icon near the clock."),
-                w!("Smart Keyboard"), MB_OK | MB_ICONINFORMATION);
+            MessageBoxW(None, w!("TypeFlow is already running. Look for its icon near the clock."),
+                w!("TypeFlow"), MB_OK | MB_ICONINFORMATION);
             return Ok(());
         }
 
@@ -931,14 +996,14 @@ pub fn run() -> Result<()> {
         let class = WNDCLASSW {
             lpfnWndProc: Some(window_proc),
             hInstance: instance.into(),
-            lpszClassName: w!("SmartKeyboardBubble"),
+            lpszClassName: w!("TypeFlowBubble"),
             hCursor: LoadCursorW(None, IDC_HAND)?,
             ..Default::default()
         };
         RegisterClassW(&class);
         let window = CreateWindowExW(
             WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
-            w!("SmartKeyboardBubble"),
+            w!("TypeFlowBubble"),
             PCWSTR::null(),
             WS_POPUP,
             0, 0, 10, 10,
@@ -948,8 +1013,8 @@ pub fn run() -> Result<()> {
         // can't be activated, which the tray menu needs to close properly.
         let tray_window = CreateWindowExW(
             WINDOW_EX_STYLE(0),
-            w!("SmartKeyboardBubble"),
-            w!("Smart Keyboard"),
+            w!("TypeFlowBubble"),
+            w!("TypeFlow"),
             WS_POPUP,
             0, 0, 0, 0,
             None, None, instance, None,
@@ -981,6 +1046,17 @@ pub fn run() -> Result<()> {
 
         let _kb = SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook), instance, 0)?;
         let _mouse = SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook), instance, 0)?;
+
+        // Debug builds: SMART_KEYBOARD_DEMO="سلام" shows that hint at startup,
+        // to look at the glass without typing (simulated keys are ignored).
+        #[cfg(debug_assertions)]
+        if let Ok(demo) = std::env::var("SMART_KEYBOARD_DEMO") {
+            let fa = demo.chars().any(|c| ('\u{0600}'..='\u{06FF}').contains(&c));
+            show_bubble(window, &demo, if fa { Lang::Fa } else { Lang::En }, 0);
+            if let Some(Some(b)) = with_state(|s| s.bubble.as_ref().map(|b| b.rect)) {
+                println!("demo bubble at {},{} {}x{}", b.left, b.top, b.right - b.left, b.bottom - b.top);
+            }
+        }
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
@@ -1137,63 +1213,36 @@ mod previews {
         std::fs::write(path, out).unwrap();
     }
 
-    unsafe fn render_bubble(text: &str, rtl: bool) -> (i32, i32, Vec<u32>) {
-        let screen = GetDC(None);
-        let dc = CreateCompatibleDC(screen);
-        let (w, h) = measure_bubble(dc, text, rtl);
-        let bmp = CreateCompatibleBitmap(screen, w, h);
-        let old = SelectObject(dc, bmp);
-        draw_bubble(dc, RECT { left: 0, top: 0, right: w, bottom: h }, text, rtl);
-        SelectObject(dc, old);
-        let mut info = BITMAPINFO {
-            bmiHeader: BITMAPINFOHEADER {
-                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-                biWidth: w,
-                biHeight: -h,
-                biPlanes: 1,
-                biBitCount: 32,
-                biCompression: BI_RGB.0,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let mut px = vec![0u32; (w * h) as usize];
-        GetDIBits(dc, bmp, 0, h as u32, Some(px.as_mut_ptr() as *mut _), &mut info, DIB_RGB_COLORS);
-        let _ = DeleteObject(bmp);
-        let _ = DeleteDC(dc);
-        ReleaseDC(None, screen);
-        (w, h, px)
-    }
-
-    /// Nearest-neighbour upscale, composited on white.
-    fn upscale(size: i32, px: &[u32], k: i32) -> Vec<u32> {
-        let mut out = Vec::new();
-        for y in 0..size * k {
-            for x in 0..size * k {
-                let p = px[((y / k) * size + x / k) as usize];
-                let a = (p >> 24) as u32;
-                let ch = |s: u32| ((p >> s) & 0xFF) + (255 - a); // premultiplied over white
-                out.push(ch(16).min(255) << 16 | ch(8).min(255) << 8 | ch(0).min(255));
-            }
-        }
-        out
+    /// The bubble as DWM would show it over a flat backdrop of `under`: the
+    /// acrylic tint (theme.rs) first, then the pixels from `render_bubble`.
+    unsafe fn preview_bubble(text: &str, rtl: bool, theme: &theme::Theme, under: (u8, u8, u8)) -> (i32, i32, Vec<u32>) {
+        let c = theme.colors();
+        let (w, h, px) = super::render_bubble(text, rtl, &c);
+        let ta = c.fill_alpha as f64 / 255.0;
+        let glass = |f: u8, u: u8| f as f64 * ta + u as f64 * (1.0 - ta);
+        let back = (glass(c.fill.0, under.0), glass(c.fill.1, under.1), glass(c.fill.2, under.2));
+        let out = px
+            .iter()
+            .map(|p| {
+                let a = (p >> 24) as f64 / 255.0;
+                let ch = |s: u32, b: f64| (((p >> s) & 0xFF) as f64 + b * (1.0 - a)).round().min(255.0) as u32;
+                ch(16, back.0) << 16 | ch(8, back.1) << 8 | ch(0, back.2)
+            })
+            .collect();
+        (w, h, out)
     }
 
     #[test]
     #[ignore]
     fn previews() {
         load_fonts();
+        let light = theme::Theme { accent_on_surfaces: true, ..theme::Theme::DEFAULT };
+        let dark = theme::Theme { light: false, ..light };
         unsafe {
-            let (w, h, px) = render_bubble("سلام خوبی؟", true);
+            let (w, h, px) = preview_bubble("سلام خوبی؟", true, &light, (0xDB, 0xE4, 0xEF));
             save_bmp("target/preview/bubble_fa.bmp", w, h, &px);
-            let (w, h, px) = render_bubble("you mean hello", false);
+            let (w, h, px) = preview_bubble("hello", false, &dark, (0x10, 0x17, 0x22));
             save_bmp("target/preview/bubble_en.bmp", w, h, &px);
-        }
-        for (name, on) in [("icon_on", true), ("icon_off", false)] {
-            for size in [16, 24, 32] {
-                let px = tray::render_icon(size, on);
-                save_bmp(&format!("target/preview/{name}_{size}.bmp"), size * 8, size * 8, &upscale(size, &px, 8));
-            }
         }
     }
 }

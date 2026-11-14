@@ -1,6 +1,6 @@
 //! Settings saved between runs, and the "Start with Windows" registry entry.
 //!
-//! File: `%APPDATA%\Smart Keyboard\settings.ini`, plain `key=value` lines:
+//! File: `%APPDATA%\TypeFlow\settings.ini`, plain `key=value` lines:
 //!
 //! ```text
 //! enabled=true
@@ -55,7 +55,7 @@ impl Settings {
 
     pub fn to_text(&self) -> String {
         format!(
-            "# Smart Keyboard settings (also changed from the tray menu)\n\
+            "# TypeFlow settings (also changed from the tray menu)\n\
              enabled={}\nauto_fix={}\nsound={}\nstart_with_windows={}\n",
             self.enabled, self.auto_fix, self.sound, self.start_with_windows
         )
@@ -67,15 +67,18 @@ fn settings_file(app_folder: &str) -> Option<PathBuf> {
 }
 
 fn path() -> Option<PathBuf> {
-    settings_file("Smart Keyboard")
+    settings_file("TypeFlow")
 }
 
+/// Folders the app saved settings in under its earlier names, newest first.
+const OLD_FOLDERS: [&str; 2] = ["Smart Keyboard", "layout-hint"];
+
 /// Loads the saved settings. With no file yet, takes over the settings saved
-/// under the app's old name (layout-hint), else uses the defaults.
+/// under one of the app's old names, else uses the defaults.
 pub fn load() -> Settings {
     path()
         .and_then(|p| std::fs::read_to_string(p).ok())
-        .or_else(|| settings_file("layout-hint").and_then(|p| std::fs::read_to_string(p).ok()))
+        .or_else(|| OLD_FOLDERS.iter().find_map(|f| settings_file(f).and_then(|p| std::fs::read_to_string(p).ok())))
         .map(|text| Settings::parse(&text))
         .unwrap_or_default()
 }
@@ -97,16 +100,18 @@ pub mod autostart {
     use windows::Win32::System::Registry::*;
 
     const RUN_KEY: PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
-    const VALUE: PCWSTR = w!("Smart Keyboard");
-    /// The entry written under the app's old name.
-    const OLD_VALUE: PCWSTR = w!("layout-hint");
+    const VALUE: PCWSTR = w!("TypeFlow");
+    /// Entries written under the app's old names.
+    const OLD_VALUES: [PCWSTR; 2] = [w!("Smart Keyboard"), w!("layout-hint")];
 
-    /// Adds or removes `HKCU\...\Run\Smart Keyboard`. When adding, it points at the
+    /// Adds or removes `HKCU\...\Run\TypeFlow`. When adding, it points at the
     /// exe that is running now, so moving the exe and starting it once fixes
-    /// the entry. Any entry from the old name is removed.
+    /// the entry. Any entry from an old name is removed.
     pub fn set(on: bool) {
         unsafe {
-            let _ = RegDeleteKeyValueW(HKEY_CURRENT_USER, RUN_KEY, OLD_VALUE);
+            for old in OLD_VALUES {
+                let _ = RegDeleteKeyValueW(HKEY_CURRENT_USER, RUN_KEY, old);
+            }
             if on {
                 let Ok(exe) = std::env::current_exe() else { return };
                 let command: Vec<u16> = format!("\"{}\"", exe.display()).encode_utf16().chain([0]).collect();

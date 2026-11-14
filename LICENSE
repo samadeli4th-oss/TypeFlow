@@ -27,6 +27,5 @@ The word lists in data/ (en.txt, fa.txt) are not covered by this license.
 They are derived from wordfreq and licensed under CC BY-SA 4.0; see
 data/SOURCES.md.
 
-The fonts in assets/fonts/ are not covered by this license either: Ubuntu Sans
-is under the Ubuntu Font Licence 1.0 and Vazirmatn under the SIL Open Font
-License 1.1; see THIRD_PARTY_LICENSES.md.
+The font in assets/fonts/ is not covered by this license either: Vazirmatn is
+under the SIL Open Font License 1.1; see THIRD_PARTY_LICENSES.md.

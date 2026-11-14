@@ -1,4 +1,4 @@
-//! Smart Keyboard: shows a hint when a word was typed with the wrong keyboard
+//! TypeFlow: shows a hint when a word was typed with the wrong keyboard
 //! layout (English <-> Persian) on Windows.
 //!
 //! Based on ZabanYar by Behrooz Shayestepoor (https://github.com/shyguy2018/ZabanYar, MIT).
@@ -11,6 +11,7 @@
 mod detect;
 mod mapping;
 mod settings;
+mod theme;
 #[cfg(windows)]
 mod tray;
 #[cfg(windows)]
@@ -21,16 +22,16 @@ fn main() {
     {
         let started = std::time::Instant::now();
         detect::lexicons(); // build the dictionaries before the hook starts
-        println!("Smart Keyboard: word lists loaded in {:?}", started.elapsed());
+        println!("TypeFlow: word lists loaded in {:?}", started.elapsed());
         println!("Type anywhere. Tab = accept hint, Esc = dismiss, Pause or Right Ctrl tap = convert last word.");
         println!("Tray icon: left click = on/off, right click = menu (Exit).");
         if let Err(e) = win::run() {
-            let text: Vec<u16> = format!("Smart Keyboard could not start:\n{e}\0").encode_utf16().collect();
+            let text: Vec<u16> = format!("TypeFlow could not start:\n{e}\0").encode_utf16().collect();
             unsafe {
                 windows::Win32::UI::WindowsAndMessaging::MessageBoxW(
                     None,
                     windows::core::PCWSTR(text.as_ptr()),
-                    windows::core::w!("Smart Keyboard"),
+                    windows::core::w!("TypeFlow"),
                     windows::Win32::UI::WindowsAndMessaging::MB_ICONERROR,
                 );
             }
@@ -38,5 +39,5 @@ fn main() {
         }
     }
     #[cfg(not(windows))]
-    eprintln!("Smart Keyboard only runs on Windows.");
+    eprintln!("TypeFlow only runs on Windows.");
 }

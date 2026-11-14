@@ -1,4 +1,4 @@
-# Smart Keyboard
+# TypeFlow
 
 Shows a small hint when you type a word with the wrong keyboard layout, English ⇄ Persian, on Windows.
 
@@ -39,15 +39,15 @@ it fall back to the mouse pointer.
 
 ### Tray icon
 
-The app lives in the notification area as a rounded square with **ف**: blue when on, grey when off.
+The app lives in the notification area as **A ⇄** over **س**: in color when on, grey when off.
 Only one copy can run at a time.
 
 - **Left click**: turn hints on/off
 - **Right click**: menu with **Hints on**, **Auto-fix when sure** (convert without asking; off by
   default), **Sound** (the ding), **Start with Windows** (on by default), and **Exit**
 
-Settings are saved to `%APPDATA%\Smart Keyboard\settings.ini` whenever you change them, and you can
-also edit that file by hand. **Start with Windows** adds `Smart Keyboard` under
+Settings are saved to `%APPDATA%\TypeFlow\settings.ini` whenever you change them, and you can
+also edit that file by hand. **Start with Windows** adds `TypeFlow` under
 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`, pointing at the exe you ran. If you move the
 exe, start it once from the new place and the entry follows. Debug builds never touch that entry.
 
@@ -69,10 +69,11 @@ cargo +stable-x86_64-pc-windows-gnu test
 cargo +stable-x86_64-pc-windows-gnu run --release
 ```
 
-The app is `target\release\smart-keyboard.exe`, a single file with everything built in.
+The app is `target\release	ypeflow.exe`, a single file with everything built in.
 
-Smart Keyboard was first called *layout-hint*. On first start it takes over settings saved under
-`%APPDATA%\layout-hint\` and replaces the old `layout-hint` Start with Windows entry.
+TypeFlow was earlier called *Smart Keyboard* and, before that, *layout-hint*. On first start it
+takes over settings saved under `%APPDATA%\Smart Keyboard\` (or `%APPDATA%\layout-hint\`) and
+replaces the old Start with Windows entries.
 
 In Git Bash, Git's own `link` command can shadow the MSVC linker; build from `cmd` or PowerShell.
 
@@ -97,12 +98,21 @@ python tools/make_wordlists.py
   clearly right (or a number) ends the phrase.
 - The ding is `assets/sounds/notification.wav`, built into the exe and played with `PlaySound`.
 - [`src/settings.rs`](src/settings.rs): the settings file and the Start with Windows entry.
-- [`src/tray.rs`](src/tray.rs): the tray icon is drawn at runtime (the "ف" is measured and fitted
-  to the icon size), so there is no `.ico` file or resource compiler step.
-- Fonts: the bubble uses **Vazirmatn RD Light** for Persian and **Ubuntu Sans Condensed Light** for
-  English. Both are embedded in the exe and registered only for this process, so nothing is
-  installed on your system. To see the bubble and icon without running the app:
+- Icons: `assets/icons/typeflow.ico` is the app icon and `tray.ico` / `tray-off.ico` the tray
+  icon. All three are cut from the artwork sheet by `tools/make_icons.py` (needs Pillow and NumPy).
+  [`build.rs`](build.rs) puts the app icon into the exe by writing the resource object itself, so
+  no resource compiler is needed; [`src/tray.rs`](src/tray.rs) loads the tray icon at the size
+  Windows asks for.
+- [`src/theme.rs`](src/theme.rs): the bubble is a small acrylic glass pill that shows only the
+  suggestion. It follows Settings › Personalization › Colors: light or dark mode, the accent color
+  as a tint when "Show accent color on Start and taskbar" is on, and a solid fill when
+  Transparency effects are off. The settings are re-read every time a bubble appears.
+- Fonts: the bubble uses **Vazirmatn RD Light** for Persian, embedded in the exe and registered
+  only for this process, and the Windows 11 system font **Segoe UI Variable Text Semilight** for
+  English (Segoe UI Semilight on Windows 10). To see the bubble without running the app:
   `cargo test previews -- --ignored`, then open `target/preview/*.bmp`.
+  To see the real glass, run a debug build with `SMART_KEYBOARD_DEMO` set to some text
+  (e.g. `سلام`): it shows that hint at startup.
 - [`src/mapping.rs`](src/mapping.rs): a static key map used as a fallback and by the tests.
 
 **Privacy:** keys are kept only in memory, only for the current run of words, and are cleared on a
@@ -111,7 +121,7 @@ code.
 
 ## Acknowledgements
 
-Smart Keyboard is a Rust port of **[ZabanYar](https://github.com/shyguy2018/ZabanYar)** by
+TypeFlow is a Rust port of **[ZabanYar](https://github.com/shyguy2018/ZabanYar)** by
 **Behrooz Shayestepoor** (MIT). The detection approach and thresholds, the fallback key map, the
 test cases and the overall design of the key tracker come from ZabanYar. Thank you!
 
@@ -119,14 +129,13 @@ Word frequencies come from **[wordfreq](https://github.com/rspeer/wordfreq)** by
 (CC BY-SA 4.0).
 
 Fonts: **[Vazirmatn](https://github.com/rastikerdar/vazirmatn)** by Saber Rastikerdar and the
-Vazirmatn Project Authors (OFL 1.1), and **[Ubuntu Sans](https://github.com/canonical/Ubuntu-Sans-fonts)**
-by Canonical (Ubuntu Font Licence 1.0).
+Vazirmatn Project Authors (OFL 1.1).
 
-Notification sound: "New Notification 07" by **Universfield** (Pixabay Content License).
+Notification sound: "Notification Alert Warning" from **[Tunetank](https://tunetank.com)**.
 
 ## License
 
 - Code: [MIT](LICENSE)
 - Word lists in `data/`: [CC BY-SA 4.0](data/SOURCES.md)
-- Fonts in `assets/fonts/`: Ubuntu Font Licence 1.0 and SIL OFL 1.1 (license texts next to the fonts)
+- Font in `assets/fonts/`: SIL OFL 1.1 (license text next to the font)
 - Third-party notices: [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md)
