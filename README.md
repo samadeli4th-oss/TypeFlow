@@ -1,4 +1,4 @@
-# Smart Keyboard
+# TypeFlow, Smart language switcher for subdued
 
 Shows a small hint when you type a word with the wrong keyboard layout, English ⇄ Persian, on Windows.
 
