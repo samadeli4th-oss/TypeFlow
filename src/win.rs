@@ -181,6 +181,22 @@ fn foreground() -> (HWND, u32) {
     }
 }
 
+/// Thread whose keyboard layout is in effect: the one owning the focused
+/// control. Apps like Outlook host the editor on another thread than the
+/// top-level window, which can report a stale layout.
+fn layout_thread(fg_tid: u32) -> u32 {
+    unsafe {
+        let mut gti = GUITHREADINFO { cbSize: std::mem::size_of::<GUITHREADINFO>() as u32, ..Default::default() };
+        if GetGUIThreadInfo(fg_tid, &mut gti).is_ok() && gti.hwndFocus.0 as usize != 0 {
+            let t = GetWindowThreadProcessId(gti.hwndFocus, None);
+            if t != 0 {
+                return t;
+            }
+        }
+        fg_tid
+    }
+}
+
 fn char_for(vk: u32, scan: u32, shift: bool, caps: bool, hkl: HKL) -> String {
     let mut state = [0u8; 256];
     if shift {
@@ -397,7 +413,7 @@ impl State {
             return false;
         }
 
-        let mut lang = lang_of(unsafe { GetKeyboardLayout(tid) });
+        let mut lang = lang_of(unsafe { GetKeyboardLayout(layout_thread(tid)) });
         if let Some((pending, window, until)) = self.pending {
             if lang == Some(pending) || hwnd != window || Instant::now() > until {
                 self.pending = None;
@@ -647,30 +663,18 @@ unsafe extern "system" fn mouse_hook(code: i32, wparam: WPARAM, lparam: LPARAM) 
 // -------------------------------------------------------------------- bubble ---
 // A one-line glass pill holding only the suggestion; colors follow Windows
 // (theme.rs). Sizes are at 96 DPI.
-const HEIGHT: i32 = 32;
-const PAD: i32 = 14;
+const HEIGHT: i32 = 28;
+const PAD: i32 = 12;
 /// Longer phrases end in "…".
 const MAX_WIDTH: i32 = 420;
-const FA_PX: i32 = 18;
+/// 12 pt Persian, 11 pt English (96-DPI pixels).
+const FA_PX: i32 = 16;
 const EN_PX: i32 = 15;
 
-// The Persian font is bundled into the exe and registered privately for this
-// process (see assets/fonts/ and THIRD_PARTY_LICENSES.md).
-const FONT_FILES: [&[u8]; 1] = [include_bytes!("../assets/fonts/Vazirmatn-RD-Light.ttf")];
-pub const FA_FONT: PCWSTR = w!("Vazirmatn RD Light");
-/// English uses the Windows 11 UI font (Semilight sits well next to
-/// Vazirmatn Light), and Segoe UI on Windows 10. GDI face names stop at 31
-/// characters, hence "Semiligh".
-const EN_FONTS: [PCWSTR; 2] = [w!("Segoe UI Variable Text Semiligh"), w!("Segoe UI Semilight")];
-
-fn load_fonts() {
-    for data in FONT_FILES {
-        let mut count = 0u32;
-        unsafe {
-            AddFontMemResourceEx(data.as_ptr() as *const _, data.len() as u32, None, &mut count);
-        }
-    }
-}
+/// Fonts that ship with Windows; Segoe UI covers Persian too, and DrawText
+/// shapes it correctly.
+const FA_FONT: PCWSTR = w!("Segoe UI");
+const EN_FONT: PCWSTR = w!("Segoe UI");
 
 struct Fonts {
     fa: HFONT,
@@ -711,25 +715,7 @@ fn with_fonts<R>(f: impl FnOnce(&Fonts) -> R) -> R {
                 CreateFontW(-(px * dpi / 96), 0, 0, 0, 400, 0, 0, 0, DEFAULT_CHARSET.0 as u32,
                     OUT_DEFAULT_PRECIS.0 as u32, CLIP_DEFAULT_PRECIS.0 as u32, ANTIALIASED_QUALITY.0 as u32, 0, face)
             };
-            // GDI silently substitutes a missing face; take the first one that exists
-            let dc = CreateCompatibleDC(None);
-            let mut en = HFONT::default();
-            for face in EN_FONTS {
-                en = make(EN_PX, face);
-                let old = SelectObject(dc, en);
-                let mut buf = [0u16; 64];
-                GetTextFaceW(dc, Some(&mut buf));
-                let n = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
-                SelectObject(dc, old);
-                if String::from_utf16_lossy(&buf[..n]).eq_ignore_ascii_case(&face.to_string().unwrap_or_default()) {
-                    break;
-                }
-                if face != EN_FONTS[EN_FONTS.len() - 1] {
-                    let _ = DeleteObject(en);
-                }
-            }
-            let _ = DeleteDC(dc);
-            Fonts { fa: make(FA_PX, FA_FONT), en, dpi }
+            Fonts { fa: make(FA_PX, FA_FONT), en: make(EN_PX, EN_FONT), dpi }
         });
         f(fonts)
     })
@@ -853,9 +839,6 @@ unsafe fn render_bubble(text: &str, rtl: bool, c: &theme::Colors) -> (i32, i32, 
         SetTextColor(dc, COLORREF(0x00FF_FFFF));
         rect.left = f.px(PAD);
         rect.right = w - f.px(PAD);
-        if rtl {
-            rect.top = f.px(1); // Vazirmatn's tall ascent sits it a little high
-        }
         text_line(dc, f.main(rtl), text, &mut rect, line_flags(rtl) | DT_VCENTER | DT_END_ELLIPSIS);
         SelectObject(dc, old);
         let mut px = vec![0u32; (w * h) as usize];
@@ -1030,7 +1013,6 @@ pub fn run() -> Result<()> {
         sync_autostart(saved.start_with_windows); // also refreshes the exe path
 
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-        load_fonts();
         // COM is needed for the accessibility caret lookup (Chrome, Electron)
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
         let instance = GetModuleHandleW(None)?;
@@ -1295,7 +1277,6 @@ mod previews {
     #[test]
     #[ignore]
     fn previews() {
-        load_fonts();
         let light = theme::Theme { accent_on_surfaces: true, ..theme::Theme::DEFAULT };
         let dark = theme::Theme { light: false, ..light };
         unsafe {
