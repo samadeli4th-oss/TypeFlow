@@ -710,10 +710,10 @@ fn with_fonts<R>(f: impl FnOnce(&Fonts) -> R) -> R {
         let mut slot = cell.borrow_mut();
         let fonts = slot.get_or_insert_with(|| unsafe {
             let dpi = GetDpiForSystem() as i32;
-            // grayscale antialiasing: the text is turned into alpha over the glass
+            // ClearType: the bubble is solid, so sub-pixel text is fine
             let make = |px: i32, face: PCWSTR| {
                 CreateFontW(-(px * dpi / 96), 0, 0, 0, 400, 0, 0, 0, DEFAULT_CHARSET.0 as u32,
-                    OUT_DEFAULT_PRECIS.0 as u32, CLIP_DEFAULT_PRECIS.0 as u32, ANTIALIASED_QUALITY.0 as u32, 0, face)
+                    OUT_DEFAULT_PRECIS.0 as u32, CLIP_DEFAULT_PRECIS.0 as u32, CLEARTYPE_QUALITY.0 as u32, 0, face)
             };
             Fonts { fa: make(FA_PX, FA_FONT), en: make(EN_PX, EN_FONT), dpi }
         });
@@ -828,15 +828,18 @@ fn dib_info(w: i32, h: i32) -> BITMAPINFO {
 /// shows the blurred backdrop through everything but the letters.
 unsafe fn render_bubble(text: &str, rtl: bool, c: &theme::Colors) -> (i32, i32, Vec<u32>) {
     let (w, h) = bubble_size(text, rtl);
-    let coverage = with_fonts(|f| {
+    let rgb = |(r, g, b): (u8, u8, u8)| COLORREF(r as u32 | (g as u32) << 8 | (b as u32) << 16);
+    let pixels = with_fonts(|f| {
         let screen = GetDC(None);
         let dc = CreateCompatibleDC(screen);
         let bmp = CreateCompatibleBitmap(screen, w, h);
         let old = SelectObject(dc, bmp);
         let mut rect = RECT { left: 0, top: 0, right: w, bottom: h };
-        FillRect(dc, &rect, HBRUSH(GetStockObject(BLACK_BRUSH).0));
+        let brush = CreateSolidBrush(rgb(c.fill));
+        FillRect(dc, &rect, brush);
+        let _ = DeleteObject(brush);
         SetBkMode(dc, TRANSPARENT);
-        SetTextColor(dc, COLORREF(0x00FF_FFFF));
+        SetTextColor(dc, rgb(c.text));
         rect.left = f.px(PAD);
         rect.right = w - f.px(PAD);
         text_line(dc, f.main(rtl), text, &mut rect, line_flags(rtl) | DT_VCENTER | DT_END_ELLIPSIS);
@@ -846,23 +849,8 @@ unsafe fn render_bubble(text: &str, rtl: bool, c: &theme::Colors) -> (i32, i32, 
         let _ = DeleteObject(bmp);
         let _ = DeleteDC(dc);
         ReleaseDC(None, screen);
-        px
+        px.iter().map(|p| p | 0xFF00_0000).collect::<Vec<u32>>()
     });
-
-    // solid fill only when transparency effects are off
-    let fill_a = if c.fill_alpha == 255 { 1.0 } else { 0.0 };
-    let channel = |text: u8, fill: u8, cov: f64| (text as f64 * cov + fill as f64 * fill_a * (1.0 - cov)).round() as u32;
-    let pixels = coverage
-        .iter()
-        .map(|p| {
-            let cov = ((p >> 8) & 0xFF) as f64 / 255.0;
-            let a = (255.0 * cov + 255.0 * fill_a * (1.0 - cov)).round() as u32;
-            a << 24
-                | channel(c.text.0, c.fill.0, cov) << 16
-                | channel(c.text.1, c.fill.1, cov) << 8
-                | channel(c.text.2, c.fill.2, cov)
-        })
-        .collect();
     (w, h, pixels)
 }
 

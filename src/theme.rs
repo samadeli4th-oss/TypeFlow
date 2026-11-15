@@ -67,7 +67,8 @@ impl Theme {
         Colors {
             fill: (mix(r), mix(g), mix(b)),
             // 38% / 34%: see-through, with the blur doing the separating
-            fill_alpha: if !self.transparency { 255 } else if self.light { 97 } else { 87 },
+            // solid: text over see-through glass rendered badly
+            fill_alpha: 255,
             text: if self.light { (0x1B, 0x1B, 0x1B) } else { (0xFF, 0xFF, 0xFF) },
         }
     }
@@ -153,8 +154,8 @@ mod tests {
     }
 
     #[test]
-    fn transparency_off_is_solid() {
-        let c = Theme { transparency: false, light: false, ..Theme::DEFAULT }.colors();
+    fn bubble_is_always_solid() {
+        let c = Theme { transparency: true, light: false, ..Theme::DEFAULT }.colors();
         assert_eq!(c.fill_alpha, 255);
         assert_eq!(c.text, (255, 255, 255));
     }
