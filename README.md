@@ -25,7 +25,7 @@ English ⇄ Persian (فارسی).
 ## What it does
 
 You meant to write **سلام** but the keyboard was on English, so you got `sghl`. TypeFlow watches for
-this, shows a small glass hint with the word you meant, and lets you convert it **and** switch the
+this, shows a small hint with the word you meant, and lets you convert it **and** switch the
 layout with a single <kbd>Tab</kbd>.
 
 | You type | Layout was | TypeFlow suggests |
@@ -120,8 +120,8 @@ Only one copy can run at a time.
 
 <br>
 
-The hint is a 28 px glass pill with only the suggestion in it, set in **Segoe UI** (a Windows font, so
-nothing is bundled). It follows *Settings → Personalization → Colors*: light or dark
+The hint is a 28 px pill with only the suggestion in it: **Vazirmatn RD Light** for Persian,
+**Segoe UI Variable** for English. It follows *Settings → Personalization → Colors*: light or dark
 mode, the accent color as a tint when "Show accent color on Start and taskbar" is on, and a solid
 fill when Transparency effects are off. A change in Settings applies to the next hint.
 
@@ -249,6 +249,8 @@ TypeFlow is a Rust port of **[ZabanYar](https://github.com/shyguy2018/ZabanYar)*
 test cases and the overall design of the key tracker come from ZabanYar. Thank you!
 
 - Word frequencies: **[wordfreq](https://github.com/rspeer/wordfreq)** by Robyn Speer (CC BY-SA 4.0)
+- Font: **[Vazirmatn](https://github.com/rastikerdar/vazirmatn)** by Saber Rastikerdar and the
+  Vazirmatn Project Authors (OFL 1.1)
 - Notification sound: "Notification Alert Warning" from **[Tunetank](https://tunetank.com)**
 
 ## License
@@ -257,4 +259,5 @@ test cases and the overall design of the key tracker come from ZabanYar. Thank y
 |---|---|
 | Code | [MIT](LICENSE) |
 | Word lists in `data/` | [CC BY-SA 4.0](data/SOURCES.md) |
+| Font in `assets/fonts/` | SIL OFL 1.1 (license text next to the font) |
 | Third-party notices | [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md) |

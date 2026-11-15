@@ -45,7 +45,14 @@ for what was changed.
 
 ## Fonts
 
-The hint uses Segoe UI, which ships with Windows and is not bundled.
+The Persian font is embedded in the exe and registered privately for the app only
+(`AddFontMemResourceEx`); nothing is installed on the system.
+
+| File | Font | Source | License |
+|---|---|---|---|
+| `assets/fonts/Vazirmatn-RD-Light.ttf` | Vazirmatn RD (Round Dots) Light, © 2015 The Vazirmatn Project Authors | [rastikerdar/vazirmatn](https://github.com/rastikerdar/vazirmatn) | SIL Open Font License 1.1, see [assets/fonts/Vazirmatn-OFL.txt](assets/fonts/Vazirmatn-OFL.txt) |
+
+The font file is unmodified. English text uses Segoe UI, which ships with Windows and is not bundled.
 
 ## Notification sound
 

@@ -667,14 +667,24 @@ const HEIGHT: i32 = 28;
 const PAD: i32 = 12;
 /// Longer phrases end in "…".
 const MAX_WIDTH: i32 = 420;
-/// 12 pt Persian, 11 pt English (96-DPI pixels).
-const FA_PX: i32 = 16;
+/// 10 pt Persian, 11 pt English (96-DPI pixels).
+const FA_PX: i32 = 13;
 const EN_PX: i32 = 15;
 
-/// Fonts that ship with Windows; Segoe UI covers Persian too, and DrawText
-/// shapes it correctly.
-const FA_FONT: PCWSTR = w!("Segoe UI");
+// The Persian font is bundled into the exe and registered privately for this
+// process (see assets/fonts/ and THIRD_PARTY_LICENSES.md). English uses Segoe UI.
+const FONT_FILES: [&[u8]; 1] = [include_bytes!("../assets/fonts/Vazirmatn-RD-Light.ttf")];
+const FA_FONT: PCWSTR = w!("Vazirmatn RD Light");
 const EN_FONT: PCWSTR = w!("Segoe UI");
+
+fn load_fonts() {
+    for data in FONT_FILES {
+        let mut count = 0u32;
+        unsafe {
+            AddFontMemResourceEx(data.as_ptr() as *const _, data.len() as u32, None, &mut count);
+        }
+    }
+}
 
 struct Fonts {
     fa: HFONT,
@@ -1001,6 +1011,7 @@ pub fn run() -> Result<()> {
         sync_autostart(saved.start_with_windows); // also refreshes the exe path
 
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        load_fonts();
         // COM is needed for the accessibility caret lookup (Chrome, Electron)
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
         let instance = GetModuleHandleW(None)?;
@@ -1265,6 +1276,7 @@ mod previews {
     #[test]
     #[ignore]
     fn previews() {
+        load_fonts();
         let light = theme::Theme { accent_on_surfaces: true, ..theme::Theme::DEFAULT };
         let dark = theme::Theme { light: false, ..light };
         unsafe {
