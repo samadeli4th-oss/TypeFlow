@@ -910,10 +910,10 @@ unsafe extern "system" fn window_proc(window: HWND, msg: u32, wparam: WPARAM, lp
 pub fn run() -> Result<()> {
     unsafe {
         // only one copy at a time: two keyboard hooks would fight each other
-        let _mutex = CreateMutexW(None, true, w!("Local\\SmartKeyboard-single-instance"))?;
+        let _mutex = CreateMutexW(None, true, w!("Local\\TypeFlow-single-instance"))?;
         if GetLastError() == ERROR_ALREADY_EXISTS {
-            MessageBoxW(None, w!("Smart Keyboard is already running. Look for its icon near the clock."),
-                w!("Smart Keyboard"), MB_OK | MB_ICONINFORMATION);
+            MessageBoxW(None, w!("TypeFlow is already running. Look for its icon near the clock."),
+                w!("TypeFlow"), MB_OK | MB_ICONINFORMATION);
             return Ok(());
         }
 
@@ -931,14 +931,14 @@ pub fn run() -> Result<()> {
         let class = WNDCLASSW {
             lpfnWndProc: Some(window_proc),
             hInstance: instance.into(),
-            lpszClassName: w!("SmartKeyboardBubble"),
+            lpszClassName: w!("TypeFlowBubble"),
             hCursor: LoadCursorW(None, IDC_HAND)?,
             ..Default::default()
         };
         RegisterClassW(&class);
         let window = CreateWindowExW(
             WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
-            w!("SmartKeyboardBubble"),
+            w!("TypeFlowBubble"),
             PCWSTR::null(),
             WS_POPUP,
             0, 0, 10, 10,
@@ -948,8 +948,8 @@ pub fn run() -> Result<()> {
         // can't be activated, which the tray menu needs to close properly.
         let tray_window = CreateWindowExW(
             WINDOW_EX_STYLE(0),
-            w!("SmartKeyboardBubble"),
-            w!("Smart Keyboard"),
+            w!("TypeFlowBubble"),
+            w!("TypeFlow"),
             WS_POPUP,
             0, 0, 0, 0,
             None, None, instance, None,

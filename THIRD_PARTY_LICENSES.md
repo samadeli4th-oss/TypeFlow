@@ -2,7 +2,7 @@
 
 ## ZabanYar
 
-Smart Keyboard is a Rust port of parts of [ZabanYar](https://github.com/shyguy2018/ZabanYar)
+TypeFlow is a Rust port of parts of [ZabanYar](https://github.com/shyguy2018/ZabanYar)
 by Behrooz Shayestepoor:
 
 - `src/detect.rs`: detection logic, thresholds and test cases (from `core.py`, `tests/test_core.py`)

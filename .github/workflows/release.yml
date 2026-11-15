@@ -1,0 +1,35 @@
+name: Release
+
+# Push a tag like v0.1.0 to build TypeFlow.exe and publish it as a GitHub release.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Test
+        run: cargo test --locked
+      - name: Build
+        run: cargo build --release --locked
+      - name: Rename
+        shell: bash
+        run: cp target/release/typeflow.exe TypeFlow.exe
+      - name: Upload build
+        uses: actions/upload-artifact@v4
+        with:
+          name: TypeFlow
+          path: TypeFlow.exe
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: TypeFlow.exe
+          generate_release_notes: true
