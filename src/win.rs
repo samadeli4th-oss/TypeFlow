@@ -81,7 +81,10 @@ impl Key {
     fn new(en: String, fa: String, lang: Lang) -> Key {
         // Punctuation and spaces separate words. Keys that are a letter in
         // either layout (like `,` -> و or `;` -> ک) belong to the word.
-        let sep = !en.chars().chain(fa.chars()).any(char::is_alphanumeric);
+        // (the half-space U+200C and combining marks belong to Persian words too)
+        let sep = !en.chars().chain(fa.chars()).any(|c| {
+            c.is_alphanumeric() || matches!(c, '\u{200c}' | '\u{200d}' | '\u{0300}'..='\u{036f}' | '\u{064b}'..='\u{065f}')
+        });
         Key { en, fa, lang, sep }
     }
     fn is_space(&self) -> bool {
@@ -1166,6 +1169,12 @@ mod tests {
         type_en(&mut st, "sghl");
         let end = st.run.len();
         assert_eq!(shown(st.evaluate(end, true)).as_deref(), Some("سلام"));
+    }
+
+    #[test]
+    fn half_space_is_part_of_a_word() {
+        assert!(!Key::new("_".into(), "\u{200c}".into(), Lang::Fa).is_sep());
+        assert!(Key::new(".".into(), "/".into(), Lang::Fa).is_sep());
     }
 
     #[test]
