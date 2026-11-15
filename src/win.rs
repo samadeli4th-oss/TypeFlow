@@ -68,6 +68,7 @@ struct Key {
     en: String,
     fa: String,
     lang: Lang,
+    sep: bool,
 }
 
 impl Key {
@@ -77,8 +78,17 @@ impl Key {
             Lang::Fa => &self.fa,
         }
     }
+    fn new(en: String, fa: String, lang: Lang) -> Key {
+        // Punctuation and spaces separate words. Keys that are a letter in
+        // either layout (like `,` -> و or `;` -> ک) belong to the word.
+        let sep = !en.chars().chain(fa.chars()).any(char::is_alphanumeric);
+        Key { en, fa, lang, sep }
+    }
     fn is_space(&self) -> bool {
         self.en == " "
+    }
+    fn is_sep(&self) -> bool {
+        self.sep
     }
 }
 
@@ -318,16 +328,28 @@ fn place_bubble(caret: RECT, w: i32, h: i32, work: RECT, rtl_text: bool) -> (i32
     (x, y)
 }
 
-fn last_word_span(run: &[Key], skip_trailing_space: bool) -> (usize, usize) {
+fn last_word_span(run: &[Key], skip_trailing_seps: bool) -> (usize, usize) {
     let mut end = run.len();
-    if skip_trailing_space && end > 0 && run[end - 1].is_space() {
-        end -= 1;
+    if skip_trailing_seps {
+        while end > 0 && run[end - 1].is_sep() {
+            end -= 1;
+        }
     }
     let mut start = end;
-    while start > 0 && !run[start - 1].is_space() {
+    while start > 0 && !run[start - 1].is_sep() {
         start -= 1;
     }
     (start, end)
+}
+
+/// Widen a word start to include punctuation glued to its front, e.g. the
+/// `(` in `(word`, so it is converted along with the word.
+fn with_leading_punct(run: &[Key], mut start: usize) -> usize {
+    let lang = run.get(start).map(|k| k.lang);
+    while start > 0 && run[start - 1].is_sep() && !run[start - 1].is_space() && Some(run[start - 1].lang) == lang {
+        start -= 1;
+    }
+    start
 }
 
 // --------------------------------------------------------------------- hooks ---
@@ -389,7 +411,7 @@ impl State {
             }
             0x20 /* Space */ => {
                 let lang = lang.unwrap_or(Lang::En);
-                self.run.push(Key { en: " ".into(), fa: " ".into(), lang });
+                self.run.push(Key::new(" ".into(), " ".into(), lang));
                 self.seq += 1;
                 // pass where this word ends: by the time the message is handled,
                 // a fast typist may already be in the middle of the next word
@@ -424,14 +446,24 @@ impl State {
             self.reset();
             return false;
         }
-        self.run.push(Key { en, fa, lang });
+        let is_sep = {
+            let k = Key::new(en.clone(), fa.clone(), lang);
+            let sep = k.is_sep();
+            self.run.push(k);
+            sep
+        };
         if self.run.len() > 400 {
             self.run.drain(..200);
             self.generation += 1;
             self.bubble = None;
         }
         self.seq += 1;
-        post(self.window, WM_APP_TYPED, self.seq as usize, 0);
+        if is_sep {
+            // punctuation ends a word just like Space does
+            post(self.window, WM_APP_WORD, self.run.len(), self.generation);
+        } else {
+            post(self.window, WM_APP_TYPED, self.seq as usize, 0);
+        }
         false
     }
 
@@ -510,7 +542,7 @@ impl State {
             return Action::None;
         };
         let target = verdict.target;
-        let mut start = spans[verdict.first].0;
+        let mut start = with_leading_punct(&self.run, spans[verdict.first].0);
         self.last_fix = Some((target, Instant::now()));
         println!(
             "hint: {} word(s) {:?} -> {:?} ({:?})",
@@ -578,7 +610,7 @@ impl State {
             return Action::None;
         }
         let target = self.run[start].lang.other();
-        self.convert_from(start, target)
+        self.convert_from(with_leading_punct(&self.run, start), target)
     }
 }
 
@@ -955,7 +987,7 @@ unsafe extern "system" fn window_proc(window: HWND, msg: u32, wparam: WPARAM, lp
         WM_TIMER if wparam.0 == TIMER_IDLE => {
             let _ = KillTimer(window, TIMER_IDLE);
             let action = with_state(|s| {
-                let finished = s.run.last().map_or(true, |k| k.is_space());
+                let finished = s.run.last().map_or(true, |k| k.is_sep());
                 if finished { Action::None } else { s.evaluate(s.run.len(), true) }
             });
             perform(window, action.unwrap_or(Action::None));
@@ -1100,7 +1132,7 @@ mod tests {
     fn type_en(st: &mut State, s: &str) {
         for ch in s.chars() {
             let c = ch.to_string();
-            st.run.push(Key { en: c.clone(), fa: mapping::en_to_fa(&c), lang: Lang::En });
+            st.run.push(Key::new(c.clone(), mapping::en_to_fa(&c), Lang::En));
         }
     }
 
@@ -1134,6 +1166,18 @@ mod tests {
         type_en(&mut st, "sghl");
         let end = st.run.len();
         assert_eq!(shown(st.evaluate(end, true)).as_deref(), Some("سلام"));
+    }
+
+    #[test]
+    fn punctuation_around_a_word_is_a_separator() {
+        let mut st = state();
+        type_en(&mut st, "(sghl)");
+        let end = st.run.len();
+        assert_eq!(shown(st.evaluate(end, false)).as_deref(), Some("(سلام)"));
+        let mut st = state();
+        type_en(&mut st, "sghl.");
+        let end = st.run.len();
+        assert_eq!(shown(st.evaluate(end, false)).as_deref(), Some("سلام."));
     }
 
     // ------------------------------------------------------------ placement ---
