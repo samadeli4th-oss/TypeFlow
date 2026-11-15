@@ -1,6 +1,6 @@
 [package]
 name = "typeflow-setup"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Installer for TypeFlow: one exe that carries the app and installs it for the current user."
 license = "MIT"
