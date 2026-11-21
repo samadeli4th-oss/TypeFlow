@@ -172,6 +172,20 @@ Keys are kept **only in memory**, only for the words currently being checked, an
 click, a window switch or <kbd>Enter</kbd>. Nothing you type is written to disk or sent anywhere.
 TypeFlow has no network code at all.
 
+## Code signing policy
+
+Free code signing provided by [SignPath.io](https://about.signpath.io), certificate by
+[SignPath Foundation](https://signpath.org).
+
+- Releases are built from this repository by GitHub Actions
+  ([`.github/workflows/release.yml`](.github/workflows/release.yml)) and only those builds are
+  signed. Nothing built on a personal machine is signed.
+- Committers and reviewers: [Sam Adeli](https://github.com/samadeli4th-oss)
+- Approvers: [Sam Adeli](https://github.com/samadeli4th-oss)
+
+This program will not transfer any information to other networked systems unless specifically
+requested by the user or the person installing or operating it (see [Privacy](#privacy)).
+
 ## Build from source
 
 You need [Rust](https://rustup.rs/). With the default MSVC toolchain you also need the
@@ -218,7 +232,10 @@ and NumPy).
 
 Push a version tag and GitHub Actions builds `TypeFlow-Setup.exe` and the portable `TypeFlow.exe`
 and attaches them to a new release (see
-[`.github/workflows/release.yml`](.github/workflows/release.yml)):
+[`.github/workflows/release.yml`](.github/workflows/release.yml)). When SignPath is set up (the
+`SIGNPATH_ORGANIZATION_ID` repository variable and the `SIGNPATH_API_TOKEN` secret), the app is
+signed before it goes into the installer, and the installer is signed too; the artifact
+configurations are in [`.signpath/`](.signpath/).
 
 ```bash
 git tag v0.2.0

@@ -15,7 +15,9 @@
 use std::cell::RefCell;
 use windows::core::{Interface, VARIANT};
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
-use windows::Win32::UI::Accessibility::{AccessibleObjectFromWindow, IAccessible};
+use windows::Win32::UI::Accessibility::{
+    AccessibleObjectFromEvent, AccessibleObjectFromWindow, IAccessible, SetWinEventHook, HWINEVENTHOOK,
+};
 use std::time::{Duration, Instant};
 
 use windows::Win32::Media::Audio::{PlaySoundW, SND_ASYNC, SND_MEMORY, SND_NODEFAULT};
@@ -124,6 +126,8 @@ struct State {
     bubble: Option<Bubble>,
     /// Language the previous word was corrected to, and when.
     last_fix: Option<(Lang, Instant)>,
+    /// The focused control is a password field: keys are not recorded.
+    in_password: bool,
 }
 
 /// What the window procedure must do once the state borrow is released.
@@ -396,6 +400,9 @@ impl State {
             self.foreground = hwnd;
             self.reset();
         }
+        if self.in_password {
+            return false; // never record what is typed into a password field
+        }
         if vk == HOTKEY_VK {
             post(self.window, WM_APP_HOTKEY, 0, 0);
             return true;
@@ -649,6 +656,39 @@ unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARA
         }
     }
     CallNextHookEx(HHOOK::default(), code, wparam, lparam)
+}
+
+/// Focus moved: if it landed in a password field, stop recording keys, and
+/// beep when the keyboard is not English, before the user starts typing.
+unsafe extern "system" fn focus_event(
+    _hook: HWINEVENTHOOK, _event: u32, hwnd: HWND, id_object: i32, id_child: i32, _thread: u32, _time: u32,
+) {
+    if id_object != OBJID_CLIENT.0 || !tray::get(&tray::ENABLED) {
+        return;
+    }
+    let protected = is_password_field(hwnd, id_object, id_child);
+    let was = with_state(|s| std::mem::replace(&mut s.in_password, protected)).unwrap_or(false);
+    if protected && !was {
+        let (_, tid) = foreground();
+        if lang_of(GetKeyboardLayout(layout_thread(tid))) != Some(Lang::En) {
+            ding();
+        }
+    }
+}
+
+/// True when the focused accessible element is marked "protected" (password).
+unsafe fn is_password_field(hwnd: HWND, id_object: i32, id_child: i32) -> bool {
+    const STATE_SYSTEM_PROTECTED: i32 = 0x2000_0000;
+    let mut acc: Option<IAccessible> = None;
+    let mut child = VARIANT::default();
+    if AccessibleObjectFromEvent(hwnd, id_object as u32, id_child as u32, &mut acc, &mut child).is_err() {
+        return false;
+    }
+    let Some(acc) = acc else { return false };
+    match acc.get_accState(&child) {
+        Ok(v) => i32::try_from(&v).map_or(false, |st| st & STATE_SYSTEM_PROTECTED != 0),
+        Err(_) => false,
+    }
 }
 
 unsafe extern "system" fn mouse_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -1064,11 +1104,13 @@ pub fn run() -> Result<()> {
                 pending: None,
                 bubble: None,
                 last_fix: None,
+                in_password: false,
             })
         });
 
         let _kb = SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook), instance, 0)?;
         let _mouse = SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook), instance, 0)?;
+        let _focus = SetWinEventHook(EVENT_OBJECT_FOCUS, EVENT_OBJECT_FOCUS, HMODULE::default(), Some(focus_event), 0, 0, WINEVENT_OUTOFCONTEXT);
 
         // Debug builds: SMART_KEYBOARD_DEMO="سلام" shows that hint at startup,
         // to look at the glass without typing (simulated keys are ignored).
@@ -1109,6 +1151,7 @@ mod tests {
             pending: None,
             bubble: None,
             last_fix: None,
+            in_password: false,
         }
     }
 
