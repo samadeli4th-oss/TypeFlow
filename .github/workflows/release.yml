@@ -2,6 +2,12 @@ name: Release
 
 # Push a tag like v0.2.0 to build TypeFlow-Setup.exe (installer) and TypeFlow.exe
 # (portable) and publish them as a GitHub release.
+#
+# Code signing (SignPath Foundation): once the repository variable
+# SIGNPATH_ORGANIZATION_ID and the secret SIGNPATH_API_TOKEN are set, the app is
+# signed before it is packed into the installer, and the installer is signed
+# after. Without them the workflow builds and publishes unsigned exes as before.
+# Artifact configurations to paste into SignPath: .signpath/artifact-configuration/
 on:
   push:
     tags: ["v*"]
@@ -9,6 +15,12 @@ on:
 
 permissions:
   contents: write
+  actions: read # SignPath downloads the build artifacts
+
+env:
+  SIGN: ${{ vars.SIGNPATH_ORGANIZATION_ID != '' }}
+  # release-signing for tags, test-signing for manual runs
+  SIGNING_POLICY: ${{ startsWith(github.ref, 'refs/tags/') && 'release-signing' || 'test-signing' }}
 
 jobs:
   build:
@@ -20,16 +32,76 @@ jobs:
         run: cargo test --locked
       - name: Build app
         run: cargo build --release --locked
+      - name: Stage app
+        shell: bash
+        run: mkdir -p app && cp target/release/typeflow.exe app/TypeFlow.exe
+
+      # --- sign the app, so the installer carries a signed exe ---
+      - name: Upload unsigned app
+        id: upload-app
+        if: env.SIGN == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-unsigned
+          path: app/TypeFlow.exe
+      - name: Sign app
+        if: env.SIGN == 'true'
+        uses: signpath/github-action-submit-signing-request@v1
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG || 'TypeFlow' }}
+          signing-policy-slug: ${{ env.SIGNING_POLICY }}
+          artifact-configuration-slug: app
+          github-artifact-id: ${{ steps.upload-app.outputs.artifact-id }}
+          wait-for-completion: true
+          output-artifact-directory: app
+
       - name: Build installer
         working-directory: installer
         env:
-          TYPEFLOW_EXE: ${{ github.workspace }}\target\release\typeflow.exe
+          TYPEFLOW_EXE: ${{ github.workspace }}\app\TypeFlow.exe
         run: cargo build --release --locked
+      - name: Stage installer
+        shell: bash
+        run: mkdir -p setup && cp installer/target/release/typeflow-setup.exe setup/TypeFlow-Setup.exe
+
+      # --- sign the installer ---
+      - name: Upload unsigned installer
+        id: upload-setup
+        if: env.SIGN == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: setup-unsigned
+          path: setup/TypeFlow-Setup.exe
+      - name: Sign installer
+        if: env.SIGN == 'true'
+        uses: signpath/github-action-submit-signing-request@v1
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG || 'TypeFlow' }}
+          signing-policy-slug: ${{ env.SIGNING_POLICY }}
+          artifact-configuration-slug: installer
+          github-artifact-id: ${{ steps.upload-setup.outputs.artifact-id }}
+          wait-for-completion: true
+          output-artifact-directory: setup
+
+      - name: Check signatures
+        if: env.SIGN == 'true'
+        shell: pwsh
+        run: |
+          foreach ($f in 'app\TypeFlow.exe', 'setup\TypeFlow-Setup.exe') {
+            $s = Get-AuthenticodeSignature $f
+            Write-Host "$f : $($s.Status) $($s.SignerCertificate.Subject)"
+            if ($s.Status -ne 'Valid' -and $env:SIGNING_POLICY -eq 'release-signing') { throw "$f is not signed" }
+          }
+
       - name: Collect
         shell: bash
         run: |
-          cp target/release/typeflow.exe TypeFlow.exe
-          cp installer/target/release/typeflow-setup.exe TypeFlow-Setup.exe
+          cp app/TypeFlow.exe TypeFlow.exe
+          cp setup/TypeFlow-Setup.exe TypeFlow-Setup.exe
       - name: Upload build
         uses: actions/upload-artifact@v4
         with:
