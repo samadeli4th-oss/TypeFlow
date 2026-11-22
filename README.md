@@ -170,7 +170,9 @@ replaces the old Start with Windows entries. You can delete the old exe.
 
 Keys are kept **only in memory**, only for the words currently being checked, and are cleared on a
 click, a window switch or <kbd>Enter</kbd>. Nothing you type is written to disk or sent anywhere.
-TypeFlow has no network code at all.
+TypeFlow has no network code at all. Keys typed in password fields are never recorded. To find those
+fields, TypeFlow reads the focused control's state through the Windows accessibility APIs, never its
+contents. In Chrome, Edge, and Electron apps, this turns on their accessibility support.
 
 ## Code signing policy
 
@@ -249,6 +251,7 @@ git push origin v0.2.0
 | [`src/win.rs`](src/win.rs) | A low-level keyboard hook records each key together with what it produces in **your own** installed English and Persian layouts (`ToUnicodeEx`), so both readings of every word are known. The hint is a Win32 window drawn with GDI, which shapes and orders Persian text correctly. Conversion is Backspace × n plus `SendInput` (Unicode), followed by `WM_INPUTLANGCHANGEREQUEST` to switch the layout. |
 | [`src/theme.rs`](src/theme.rs) | Reads the Windows color settings and gives the hint its acrylic glass, tint and rounded corners. |
 | [`src/detect.rs`](src/detect.rs) | Looks both readings up in word-frequency lists (Zipf scale). If neither is a known word, it falls back to a character-bigram model and only suggests. It scores the last 5 words together, so short or ambiguous words (`تو`, `رو`, `,` → `و`) inside a sentence typed in the wrong layout add up instead of breaking the hint, while a word that is clearly right (or a number) ends the phrase. |
+| [`src/fields.rs`](src/fields.rs) | Finds password fields through the Windows accessibility APIs, on its own thread. |
 | [`src/settings.rs`](src/settings.rs) | The settings file and the Start with Windows entry. |
 | [`src/tray.rs`](src/tray.rs) | The tray icon (`assets/icons/tray.ico`, grey `tray-off.ico` when off) and its menu. |
 | [`src/mapping.rs`](src/mapping.rs) | A static key map used as a fallback and by the tests. |
