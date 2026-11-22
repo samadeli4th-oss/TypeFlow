@@ -9,6 +9,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod detect;
+#[cfg(windows)]
+mod fields;
 mod mapping;
 mod settings;
 mod theme;

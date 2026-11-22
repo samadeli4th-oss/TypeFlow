@@ -15,9 +15,7 @@
 use std::cell::RefCell;
 use windows::core::{Interface, VARIANT};
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
-use windows::Win32::UI::Accessibility::{
-    AccessibleObjectFromEvent, AccessibleObjectFromWindow, IAccessible, SetWinEventHook, HWINEVENTHOOK,
-};
+use windows::Win32::UI::Accessibility::{AccessibleObjectFromWindow, IAccessible};
 use std::time::{Duration, Instant};
 
 use windows::Win32::Media::Audio::{PlaySoundW, SND_ASYNC, SND_MEMORY, SND_NODEFAULT};
@@ -33,6 +31,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::Win32::System::Threading::CreateMutexW;
 
 use crate::detect::{self, Confidence, Lang};
+use crate::fields;
 use crate::mapping;
 use crate::settings;
 use crate::theme;
@@ -62,6 +61,7 @@ const WM_APP_TYPED: u32 = WM_APP + 2; // a letter was typed
 const WM_APP_HOTKEY: u32 = WM_APP + 3;
 const WM_APP_RESET: u32 = WM_APP + 4; // click / focus change / arrows...
 const WM_APP_ESCAPE: u32 = WM_APP + 5;
+const WM_APP_FIELD: u32 = WM_APP + 6; // focus moved (wparam = fields::FLAG_*)
 const TIMER_IDLE: usize = 1;
 const TIMER_HIDE: usize = 2;
 
@@ -128,6 +128,12 @@ struct State {
     last_fix: Option<(Lang, Instant)>,
     /// The focused control is a password field: keys are not recorded.
     in_password: bool,
+    /// The check that must finish before this text may be acted on, and the
+    /// newest one finished. Until then it could be going into a password field.
+    field_needed: u64,
+    field_checked: u64,
+    /// A finished word waiting for that check: (end, generation).
+    word_waiting: Option<(usize, usize)>,
 }
 
 /// What the window procedure must do once the state borrow is released.
@@ -429,6 +435,11 @@ impl State {
             }
         }
 
+        // the first key of new text: find out what kind of field it's going into
+        if self.run.is_empty() && (vk == 0x20 || is_typing_vk(vk)) {
+            self.field_needed = fields::poke();
+        }
+
         match vk {
             0x08 /* Backspace */ => {
                 self.run.pop();
@@ -626,6 +637,28 @@ impl State {
         Action::Convert { backspaces, text, switch_to }
     }
 
+    /// The field has been checked since this text began, and isn't a password.
+    fn field_ready(&self) -> bool {
+        !self.in_password && self.field_checked >= self.field_needed
+    }
+
+    /// A report from the field watcher. Returns a word that was waiting for it.
+    fn on_field_report(&mut self, flags: usize, request: u64) -> Option<(usize, usize)> {
+        self.field_checked = self.field_checked.max(request);
+        if flags & fields::FLAG_UNCHANGED == 0 {
+            self.in_password = flags & fields::FLAG_PASSWORD != 0;
+        }
+        if self.in_password {
+            // anything recorded before the check came back was a password
+            self.run.clear();
+            self.word_waiting = None;
+            self.seq += 1;
+            self.generation += 1;
+            return None;
+        }
+        if self.field_ready() { self.word_waiting.take() } else { None }
+    }
+
     fn on_hotkey(&mut self) -> Action {
         if let Some(b) = &self.bubble {
             let (start, target) = (b.start, b.target);
@@ -658,42 +691,12 @@ unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARA
     CallNextHookEx(HHOOK::default(), code, wparam, lparam)
 }
 
-/// Focus moved: if it landed in a password field, stop recording keys, and
-/// beep when the keyboard is not English, before the user starts typing.
-unsafe extern "system" fn focus_event(
-    _hook: HWINEVENTHOOK, _event: u32, hwnd: HWND, id_object: i32, id_child: i32, _thread: u32, _time: u32,
-) {
-    if id_object != OBJID_CLIENT.0 || !tray::get(&tray::ENABLED) {
-        return;
-    }
-    let protected = is_password_field(hwnd, id_object, id_child);
-    let was = with_state(|s| std::mem::replace(&mut s.in_password, protected)).unwrap_or(false);
-    if protected && !was {
-        let (_, tid) = foreground();
-        if lang_of(GetKeyboardLayout(layout_thread(tid))) != Some(Lang::En) {
-            ding();
-        }
-    }
-}
-
-/// True when the focused accessible element is marked "protected" (password).
-unsafe fn is_password_field(hwnd: HWND, id_object: i32, id_child: i32) -> bool {
-    const STATE_SYSTEM_PROTECTED: i32 = 0x2000_0000;
-    let mut acc: Option<IAccessible> = None;
-    let mut child = VARIANT::default();
-    if AccessibleObjectFromEvent(hwnd, id_object as u32, id_child as u32, &mut acc, &mut child).is_err() {
-        return false;
-    }
-    let Some(acc) = acc else { return false };
-    match acc.get_accState(&child) {
-        Ok(v) => i32::try_from(&v).map_or(false, |st| st & STATE_SYSTEM_PROTECTED != 0),
-        Err(_) => false,
-    }
-}
-
 unsafe extern "system" fn mouse_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     let msg = wparam.0 as u32;
     if code == HC_ACTION as i32 && tray::get(&tray::ENABLED) && (msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN) {
+        if msg == WM_LBUTTONDOWN {
+            let _ = fields::poke(); // a click may have moved focus into a browser field
+        }
         let m = &*(lparam.0 as *const MSLLHOOKSTRUCT);
         with_state(|s| s.on_click(m.pt));
     }
@@ -999,11 +1002,39 @@ unsafe extern "system" fn window_proc(window: HWND, msg: u32, wparam: WPARAM, lp
         WM_APP_WORD => {
             let _ = KillTimer(window, TIMER_IDLE);
             let (end, generation) = (wparam.0, lparam.0 as usize);
+            let ready = with_state(|s| {
+                let ready = s.field_ready();
+                if !ready && !s.in_password {
+                    s.word_waiting = Some((end, generation));
+                }
+                ready
+            })
+            .unwrap_or(false);
+            if !ready {
+                return LRESULT(0);
+            }
             let action = with_state(|s| {
                 // the text was cleared or shifted since that Space: indices are stale
                 if s.generation == generation { s.evaluate(end, false) } else { Action::None }
             });
             perform(window, action.unwrap_or(Action::None));
+        }
+        WM_APP_FIELD => {
+            let was = with_state(|s| s.in_password).unwrap_or(false);
+            let waiting = with_state(|s| s.on_field_report(wparam.0, lparam.0 as u64)).flatten();
+            if with_state(|s| s.in_password).unwrap_or(false) {
+                hide_bubble(window);
+                if !was {
+                    // beep before the user starts typing with the wrong keyboard
+                    let (_, tid) = foreground();
+                    if lang_of(GetKeyboardLayout(layout_thread(tid))) != Some(Lang::En) {
+                        ding();
+                    }
+                }
+            }
+            if let Some((end, generation)) = waiting {
+                post(window, WM_APP_WORD, end, generation);
+            }
         }
         WM_APP_TYPED => {
             SetTimer(window, TIMER_IDLE, IDLE_MS, None); // restarts on every key
@@ -1012,7 +1043,7 @@ unsafe extern "system" fn window_proc(window: HWND, msg: u32, wparam: WPARAM, lp
             let _ = KillTimer(window, TIMER_IDLE);
             let action = with_state(|s| {
                 let finished = s.run.last().map_or(true, |k| k.is_sep());
-                if finished { Action::None } else { s.evaluate(s.run.len(), true) }
+                if finished || !s.field_ready() { Action::None } else { s.evaluate(s.run.len(), true) }
             });
             perform(window, action.unwrap_or(Action::None));
         }
@@ -1105,12 +1136,15 @@ pub fn run() -> Result<()> {
                 bubble: None,
                 last_fix: None,
                 in_password: false,
+                field_needed: 0,
+                field_checked: 0,
+                word_waiting: None,
             })
         });
 
         let _kb = SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook), instance, 0)?;
         let _mouse = SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook), instance, 0)?;
-        let _focus = SetWinEventHook(EVENT_OBJECT_FOCUS, EVENT_OBJECT_FOCUS, HMODULE::default(), Some(focus_event), 0, 0, WINEVENT_OUTOFCONTEXT);
+        fields::start(window, WM_APP_FIELD);
 
         // Debug builds: SMART_KEYBOARD_DEMO="سلام" shows that hint at startup,
         // to look at the glass without typing (simulated keys are ignored).
@@ -1152,7 +1186,44 @@ mod tests {
             bubble: None,
             last_fix: None,
             in_password: false,
+            field_needed: 0,
+            field_checked: 0,
+            word_waiting: None,
         }
+    }
+
+    #[test]
+    fn nothing_is_acted_on_until_the_field_is_checked() {
+        let mut st = state();
+        type_en(&mut st, "sghl ");
+        st.field_needed = 3;
+        assert!(!st.field_ready());
+        st.word_waiting = Some((5, st.generation));
+        // an older check doesn't count
+        assert_eq!(st.on_field_report(0, 2), None);
+        assert!(!st.field_ready());
+        assert_eq!(st.on_field_report(0, 3), Some((5, 0)));
+        assert!(st.field_ready());
+    }
+
+    #[test]
+    fn text_found_to_be_a_password_is_erased() {
+        let mut st = state();
+        type_en(&mut st, "secret ");
+        st.field_needed = 1;
+        st.word_waiting = Some((7, st.generation));
+        let generation = st.generation;
+        assert_eq!(st.on_field_report(fields::FLAG_PASSWORD, 1), None);
+        assert!(st.run.is_empty() && st.in_password && st.word_waiting.is_none());
+        assert_ne!(st.generation, generation);
+    }
+
+    #[test]
+    fn an_unknown_report_keeps_password_protection_on() {
+        let mut st = state();
+        st.in_password = true;
+        st.on_field_report(fields::FLAG_UNCHANGED, 1);
+        assert!(st.in_password);
     }
 
     /// Simulates typing `s` with the English layout active.
