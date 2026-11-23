@@ -1,28 +1,38 @@
 //! Notification-area (tray) icon, its menu, and the runtime settings it toggles.
 //!
-//! Left click: turn hints on/off. Right click: menu.
+//! Left click: open the TypeFlow window (panel.rs). Right click: menu.
 //! The icon is the TypeFlow artwork from assets/icons/: in color when hints
 //! are on, grey when they're off.
 
 use std::cell::Cell;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::*;
 use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-use crate::settings::Settings;
+use crate::settings::{FieldAction, Settings};
 
 /// Message the shell sends us for clicks on the icon.
 pub const WM_TRAY: u32 = WM_APP + 20;
+/// The TypeFlow window asks for a command (wparam = CMD_*).
+pub const WM_PANEL_COMMAND: u32 = WM_APP + 21;
 const ICON_ID: u32 = 1;
 
 pub const CMD_ENABLED: usize = 1;
 pub const CMD_AUTO_FIX: usize = 2;
 pub const CMD_DING: usize = 3;
 pub const CMD_AUTOSTART: usize = 4;
+pub const CMD_AUTOCORRECT_EN: usize = 5;
+pub const CMD_AUTOCORRECT_FA: usize = 6;
+pub const CMD_OPEN: usize = 7;
 pub const CMD_EXIT: usize = 9;
+pub const CMD_FIELD_ENGLISH: usize = 10;
+pub const CMD_FIELD_NOTIFY: usize = 11;
+pub const CMD_FIELD_DISABLE: usize = 12;
+pub const CMD_LEARN: usize = 13;
+pub const CMD_WORDS: usize = 14;
 
 /// Hints on/off.
 pub static ENABLED: AtomicBool = AtomicBool::new(true);
@@ -32,9 +42,34 @@ pub static AUTO_FIX: AtomicBool = AtomicBool::new(false);
 pub static DING: AtomicBool = AtomicBool::new(true);
 /// Run at Windows sign-in.
 pub static START_WITH_WINDOWS: AtomicBool = AtomicBool::new(true);
+/// Auto-correct for English text.
+pub static AUTOCORRECT_EN: AtomicBool = AtomicBool::new(false);
+/// Auto-correct for Persian text.
+pub static AUTOCORRECT_FA: AtomicBool = AtomicBool::new(false);
+/// Learn a word once its hint or auto-fix was rejected 4 times.
+pub static LEARN_WORDS: AtomicBool = AtomicBool::new(false);
+/// Password and number fields (a `FieldAction`).
+static FIELD_ACTION: AtomicU8 = AtomicU8::new(FieldAction::English as u8);
+
+pub fn field_action() -> FieldAction {
+    match FIELD_ACTION.load(Ordering::Relaxed) {
+        1 => FieldAction::Notify,
+        2 => FieldAction::Disable,
+        _ => FieldAction::English,
+    }
+}
+
+pub fn set_field_action(action: FieldAction) {
+    FIELD_ACTION.store(action as u8, Ordering::Relaxed);
+}
 
 pub fn get(flag: &AtomicBool) -> bool {
     flag.load(Ordering::Relaxed)
+}
+
+/// True while anything needs the keyboard: layout hints or auto-correct.
+pub fn active() -> bool {
+    get(&ENABLED) || get(&AUTOCORRECT_EN) || get(&AUTOCORRECT_FA)
 }
 
 pub fn apply(s: &Settings) {
@@ -42,6 +77,10 @@ pub fn apply(s: &Settings) {
     AUTO_FIX.store(s.auto_fix, Ordering::Relaxed);
     DING.store(s.sound, Ordering::Relaxed);
     START_WITH_WINDOWS.store(s.start_with_windows, Ordering::Relaxed);
+    AUTOCORRECT_EN.store(s.autocorrect_en, Ordering::Relaxed);
+    AUTOCORRECT_FA.store(s.autocorrect_fa, Ordering::Relaxed);
+    LEARN_WORDS.store(s.learn_words, Ordering::Relaxed);
+    set_field_action(s.field_action);
 }
 
 pub fn current() -> Settings {
@@ -50,6 +89,10 @@ pub fn current() -> Settings {
         auto_fix: get(&AUTO_FIX),
         sound: get(&DING),
         start_with_windows: get(&START_WITH_WINDOWS),
+        autocorrect_en: get(&AUTOCORRECT_EN),
+        autocorrect_fa: get(&AUTOCORRECT_FA),
+        field_action: field_action(),
+        learn_words: get(&LEARN_WORDS),
     }
 }
 
@@ -111,6 +154,17 @@ pub fn remove(window: HWND) {
     }
 }
 
+/// Where the icon is on screen. Fails if the shell can't say.
+pub fn icon_rect(window: HWND) -> Option<RECT> {
+    let id = NOTIFYICONIDENTIFIER {
+        cbSize: std::mem::size_of::<NOTIFYICONIDENTIFIER>() as u32,
+        hWnd: window,
+        uID: ICON_ID,
+        ..Default::default()
+    };
+    unsafe { Shell_NotifyIconGetRect(&id) }.ok()
+}
+
 /// Shows the right-click menu at the mouse and returns the chosen command (0 = none).
 pub fn show_menu(window: HWND) -> usize {
     unsafe {
@@ -119,10 +173,13 @@ pub fn show_menu(window: HWND) -> usize {
             let _ = AppendMenuW(menu, flags, id, text);
         };
         let check = |flag: &AtomicBool| if get(flag) { MF_CHECKED } else { MF_UNCHECKED };
-        item(MF_STRING | MF_GRAYED, 0, w!("TypeFlow  ·  English ⇄ فارسی"));
+        item(MF_STRING, CMD_OPEN, w!("Open TypeFlow"));
+        let _ = SetMenuDefaultItem(menu, CMD_OPEN as u32, 0);
         item(MF_SEPARATOR, 0, PCWSTR::null());
         item(MF_STRING | check(&ENABLED), CMD_ENABLED, w!("Hints on"));
         item(MF_STRING | check(&AUTO_FIX), CMD_AUTO_FIX, w!("Auto-fix when sure"));
+        item(MF_STRING | check(&LEARN_WORDS), CMD_LEARN, w!("Learn new words"));
+        item(MF_STRING, CMD_WORDS, w!("Add word…"));
         item(MF_STRING | check(&DING), CMD_DING, w!("Sound"));
         item(MF_STRING | check(&START_WITH_WINDOWS), CMD_AUTOSTART, w!("Start with Windows"));
         item(MF_SEPARATOR, 0, PCWSTR::null());
@@ -162,7 +219,11 @@ pub fn ico_image(ico: &[u8], size: i32) -> Option<&[u8]> {
 }
 
 fn make_icon(enabled: bool) -> HICON {
-    let size = unsafe { GetSystemMetrics(SM_CXSMICON) }.max(16);
+    icon_of_size(enabled, unsafe { GetSystemMetrics(SM_CXSMICON) }.max(16))
+}
+
+/// The tray artwork at `size` px. The caller destroys it.
+pub fn icon_of_size(enabled: bool, size: i32) -> HICON {
     let Some(image) = ico_image(if enabled { TRAY_ON } else { TRAY_OFF }, size) else { return HICON::default() };
     unsafe { CreateIconFromResourceEx(image, TRUE, 0x0003_0000, size, size, LR_DEFAULTCOLOR) }.unwrap_or_default()
 }

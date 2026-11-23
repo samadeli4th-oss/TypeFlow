@@ -16,8 +16,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
 use crate::mapping::{is_persian_char, normalize_fa};
+use crate::userwords;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Lang {
     En,
     Fa,
@@ -129,7 +130,7 @@ fn fa_key(s: &str) -> String {
 }
 
 /// `[a-z]+('[a-z]+)?`
-fn is_english_word(s: &str) -> bool {
+pub(crate) fn is_english_word(s: &str) -> bool {
     let part = |p: &str| !p.is_empty() && p.bytes().all(|b| b.is_ascii_lowercase());
     match s.split_once('\'') {
         Some((a, b)) => part(a) && part(b),
@@ -154,6 +155,30 @@ fn clean_fa(s: &str) -> String {
     fa_key(s.trim_matches(|c| ".،؛:!؟?«»()[]-_/\\\"'".contains(c)))
 }
 
+/// The form a word is looked up by.
+pub fn lookup_key(lang: Lang, word: &str) -> String {
+    match lang {
+        Lang::En => clean_en(word),
+        Lang::Fa => clean_fa(word),
+    }
+}
+
+/// How common a word the user added counts as: enough to win against a reading
+/// that isn't a word, but not against a common word in the language typed.
+const USER_WORD_ZIPF: f64 = 4.0;
+
+fn known_zipf(lexicon: &Lexicon, lang: Lang, key: &str) -> f64 {
+    if key.is_empty() {
+        return 0.0;
+    }
+    let zipf = lexicon.zipf(key);
+    if userwords::contains(lang, key) {
+        zipf.max(USER_WORD_ZIPF)
+    } else {
+        zipf
+    }
+}
+
 // ----------------------------------------------------------------- decision ---
 
 /// * `en_str`  - the keys as they read in the English layout
@@ -167,6 +192,9 @@ pub fn decide(en_str: &str, fa_str: &str, typed: Lang, context: Option<Lang>) ->
     let f = clean_fa(fa_str);
     let f_len = f.chars().count();
 
+    if userwords::contains(typed, if typed == Lang::En { &e } else { &f }) {
+        return None; // the user says this word is right
+    }
     if typed == Lang::Fa && e.is_empty() {
         return None; // the keys don't make an English word
     }
@@ -177,8 +205,8 @@ pub fn decide(en_str: &str, fa_str: &str, typed: Lang, context: Option<Lang>) ->
         return None; // the keys don't even make Persian letters
     }
 
-    let ez = if e.is_empty() { 0.0 } else { en_lex.zipf(&e) };
-    let fz = fa_lex.zipf(&f);
+    let ez = known_zipf(en_lex, Lang::En, &e);
+    let fz = known_zipf(fa_lex, Lang::Fa, &f);
     let (own, other, target, replacement) = match typed {
         Lang::En => (ez, fz, Lang::Fa, normalize_fa(fa_str)),
         Lang::Fa => (fz, ez, Lang::En, en_str.to_string()),
@@ -232,14 +260,17 @@ pub fn evidence(en_str: &str, fa_str: &str, typed: Lang) -> f64 {
     let (en_lex, fa_lex) = lexicons();
     let e = clean_en(en_str);
     let f = clean_fa(fa_str);
+    if userwords::contains(typed, if typed == Lang::En { &e } else { &f }) {
+        return -4.0; // the user says this word is right
+    }
     if typed == Lang::Fa && e.is_empty() {
         return -4.0; // the keys can't spell English
     }
     if typed == Lang::En && !f.is_empty() && !f.chars().any(is_persian_char) {
         return -4.0; // the keys can't spell Persian
     }
-    let ez = if e.is_empty() { 0.0 } else { en_lex.zipf(&e) };
-    let fz = if f.is_empty() { 0.0 } else { fa_lex.zipf(&f) };
+    let ez = known_zipf(en_lex, Lang::En, &e);
+    let fz = known_zipf(fa_lex, Lang::Fa, &f);
     let (own, other) = match typed {
         Lang::En => (ez, fz),
         Lang::Fa => (fz, ez),
@@ -401,6 +432,41 @@ mod tests {
         assert_eq!(v[2].map(|p| p.first), Some(2));
         let v = typing("hello sghl", Lang::En);
         assert_eq!(v[1].map(|p| p.first), Some(1));
+    }
+
+    #[test]
+    fn a_user_word_gets_no_hint_in_its_own_language() {
+        userwords::clear_for_test();
+        assert!(typed_en("sghl", None).is_some());
+        userwords::add(Lang::En, "sghl").unwrap();
+        assert_eq!(typed_en("sghl", None), None);
+        assert_eq!(typed_en("Sghl.", None), None);
+        userwords::clear_for_test();
+    }
+
+    #[test]
+    fn a_user_word_is_recognized_from_the_other_layout() {
+        userwords::clear_for_test();
+        let typed = en_to_fa("zqxvjk");
+        assert_eq!(typed_fa(&typed, None).map(|v| v.replacement), None);
+        userwords::add(Lang::En, "zqxvjk").unwrap();
+        let v = typed_fa(&typed, None).unwrap();
+        assert_eq!((v.confidence, v.replacement.as_str(), v.target), (Confidence::Sure, "zqxvjk", Lang::En));
+
+        userwords::add(Lang::Fa, "تهرانپارسی").unwrap();
+        let keys = fa_to_en("تهرانپارسی");
+        assert_eq!(typed_en(&keys, None).map(|v| v.replacement).as_deref(), Some("تهرانپارسی"));
+        userwords::clear_for_test();
+    }
+
+    #[test]
+    fn a_user_word_ends_a_phrase() {
+        userwords::clear_for_test();
+        userwords::add(Lang::En, "fhfh").unwrap();
+        let v = typing("fhfh sghl", Lang::En);
+        assert_eq!(v[0], None);
+        assert_eq!(v[1].map(|p| p.first), Some(1));
+        userwords::clear_for_test();
     }
 
     /// Run with `cargo test explore -- --ignored --nocapture` to see the scores.

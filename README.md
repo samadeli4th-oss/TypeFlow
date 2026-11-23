@@ -45,7 +45,8 @@ Real words in the layout you're using are left alone.
 - 🤖 **Optional auto-fix**: converts on its own when it's sure.
 - 🪟 **Looks like Windows**: the hint is a small acrylic glass pill that follows your light/dark mode, accent color and transparency settings.
 - 📍 **Stays out of the way**: the hint appears next to the text cursor without covering what you're typing.
-- 🔒 **Private**: no network code, nothing saved to disk except your settings.
+- 📖 **Custom words**: add your own words per language, or let TypeFlow learn the ones you keep rejecting.
+- 🔒 **Private**: no network code. Only your settings and your custom words are saved to disk.
 - 📦 **Nothing else to install**: one installer (or one portable `.exe`) with everything built in.
 
 > [!NOTE]
@@ -99,19 +100,85 @@ grows to cover the whole phrase.
 | <kbd>Esc</kbd>, or just ignore it | Dismiss (the hint disappears after 5 seconds) |
 | <kbd>Pause</kbd>, or tap <kbd>Right Ctrl</kbd> on its own | Accept the hint; with no hint, convert the last word |
 
+### Auto-correct
+
+Turn it on for English, فارسی, or both in the TypeFlow window. After you finish a misspelled word
+with <kbd>Space</kbd>, a list of up to 5 corrections appears near the text cursor, most likely first,
+each with its confidence, and a sound plays that is different from the wrong-layout sound. Nothing
+changes until you choose one.
+
+| Action | What it does |
+|---|---|
+| <kbd>Tab</kbd> or **click** a word | Replace the misspelled word |
+| <kbd>↑</kbd> / <kbd>↓</kbd> | Move through the list |
+| <kbd>Space</kbd> after using <kbd>↑</kbd> / <kbd>↓</kbd> | Replace the word with the selected one, followed by a space |
+| <kbd>Esc</kbd>, or just ignore it | Dismiss (the list disappears after 5 seconds) |
+
+A wrong-layout hint always comes first. URLs, emails, numbers, ALL CAPS, mixedCase words, and
+capitalized names in mid-sentence are left alone, and colloquial Persian such as `میخوام` counts as
+correct.
+
+### Custom words
+
+Open **Custom words** in the TypeFlow window, or **Add word…** in the tray menu. Choose English or
+فارسی, type the word, and press <kbd>Enter</kbd>. TypeFlow stops flagging that word in its language,
+recognizes it when it's typed in the wrong layout, and leaves it out of auto-correct. The same window
+lists every word, with **×** to remove one.
+
+Turn on **Learn new words** (off by default) to add words automatically. A word is learned the 4th
+time you reject it:
+
+| What counts as rejecting | Details |
+|---|---|
+| <kbd>Esc</kbd> on the hint | The word is still as you typed it |
+| Ignoring the hint | You kept typing after the word until the hint disappeared |
+| Undoing an auto-fix | <kbd>Pause</kbd>, a <kbd>Right Ctrl</kbd> tap, or <kbd>Ctrl</kbd>+<kbd>Z</kbd> right after it, within 20 seconds |
+
+Accepting the hint for a word restarts its count. Learning only looks at single plain words of at
+least 3 letters. It skips anything with digits, symbols or mixed case, and everything typed in a
+terminal, so a password in a field Windows doesn't report as one isn't picked up. Counts are kept in
+memory and start over when TypeFlow restarts.
+
+### Password and number fields
+
+When you enter a password or number field and the keyboard isn't English, TypeFlow can help. Choose
+what it does in the TypeFlow window:
+
+| Option | What it does |
+|---|---|
+| **Change keyboard to English** (default) | Plays a sound and switches the keyboard to English |
+| **Notify** | Only plays the sound |
+| **Disable** | Does nothing |
+
+This sound has its own setting, so the **Sound** switch doesn't affect it. In browsers, TypeFlow
+recognizes `password`, `number`, and `tel` inputs. Browsers don't report fields that are only marked
+with `inputmode="numeric"`, so those count as ordinary text, but digits are never recorded anywhere.
+
+TypeFlow doesn't read keys in these fields, in terminals, or in controls it can't identify, so hints
+and auto-correct don't appear there. Right after focus moves, it waits to confirm the new field, so
+the first word typed immediately afterwards may not be checked.
+
 ### Tray icon
 
 TypeFlow lives in the notification area as **A ⇄** over **س**: in color when on, grey when off.
 Only one copy can run at a time.
 
-- **Left click**: turn hints on or off
+- **Left click**: open the TypeFlow window beside the icon
 - **Right click**: open the menu
+
+The TypeFlow window holds every setting, including separate **Auto-correct** switches for English
+and فارسی (both off by default). It closes with
+<kbd>Esc</kbd> or when you click somewhere else. <kbd>Tab</kbd> or the arrow keys move between
+settings, and <kbd>Space</kbd> or <kbd>Enter</kbd> changes one.
 
 | Menu item | Default | Description |
 |---|---|---|
+| Open TypeFlow | | Open the TypeFlow window |
 | Hints on | On | Show the hint when a wrong layout is detected |
 | Auto-fix when sure | Off | Convert without asking when TypeFlow is confident |
-| Sound | On | Play a short sound when a hint appears |
+| Learn new words | Off | Treat a word as valid after you reject it 4 times |
+| Add word… | | Open the Custom words window |
+| Sound | On | Play one sound for a wrong layout and another for a typo |
 | Start with Windows | On | Launch TypeFlow when you sign in |
 | Exit | | Quit TypeFlow |
 
@@ -151,7 +218,14 @@ enabled=true
 auto_fix=false
 sound=true
 start_with_windows=true
+autocorrect_en=false
+autocorrect_fa=false
+field_action=english
+learn_words=false
 ```
+
+Custom words are in `%APPDATA%\TypeFlow\words.txt`, one `language<TAB>word` per line (`en` or
+`fa`), with a third `learned` column for learned words.
 
 **Start with Windows** adds `TypeFlow` under
 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`, pointing at the exe you ran. If you move the
@@ -169,8 +243,21 @@ replaces the old Start with Windows entries. You can delete the old exe.
 ## Privacy
 
 Keys are kept **only in memory**, only for the words currently being checked, and are cleared on a
-click, a window switch or <kbd>Enter</kbd>. Nothing you type is written to disk or sent anywhere.
-TypeFlow has no network code at all.
+click, a window switch or <kbd>Enter</kbd>. Nothing you type is sent anywhere. The only typed text
+written to disk is your Custom words list: words you add, and, if you turn on **Learn new words**,
+words you rejected 4 times. You can see and remove all of them in the Custom words window.
+TypeFlow has no network code at all. Auto-correct runs on your PC, using TypeFlow's word lists and
+the spellchecker built into Windows.
+
+TypeFlow only reads keys in a control it has confirmed is an ordinary text box. Password, number and
+terminal input is ignored, and so is any control that can't be identified. Digits are never recorded
+in any field, so PINs, one-time codes and card numbers stay out of memory even in a plain text box.
+To identify a field, TypeFlow reads the control's type through the Windows accessibility APIs, never
+its name or contents. In Chrome, Edge, and Electron apps, this turns on their accessibility support.
+
+Two limits remain. A site or app that shows a password box but reports it as plain text can't be told
+apart from a real text box, and a script that moves focus inside a page can go unnoticed for up to a
+tenth of a second, the interval at which TypeFlow rechecks browsers and Electron apps.
 
 ## Code signing policy
 
@@ -251,11 +338,15 @@ git push origin v0.2.0
 | [`src/detect.rs`](src/detect.rs) | Looks both readings up in word-frequency lists (Zipf scale). If neither is a known word, it falls back to a character-bigram model and only suggests. It scores the last 5 words together, so short or ambiguous words (`تو`, `رو`, `,` → `و`) inside a sentence typed in the wrong layout add up instead of breaking the hint, while a word that is clearly right (or a number) ends the phrase. |
 | [`src/settings.rs`](src/settings.rs) | The settings file and the Start with Windows entry. |
 | [`src/tray.rs`](src/tray.rs) | The tray icon (`assets/icons/tray.ico`, grey `tray-off.ico` when off) and its menu. |
+| [`src/panel.rs`](src/panel.rs) | The TypeFlow settings window that opens beside the tray icon. |
+| [`src/spell.rs`](src/spell.rs) | Auto-correct for English and Persian, on a background thread: finds nearby words, ranks them by word frequency and how likely the typing mistake is, and asks the Windows spellchecker whether a word is real. |
+| [`src/suggest.rs`](src/suggest.rs) | The list of corrections, sorted by confidence. |
+| [`src/fields.rs`](src/fields.rs) | Finds password and number fields through the Windows accessibility APIs, on its own thread. |
 | [`src/mapping.rs`](src/mapping.rs) | A static key map used as a fallback and by the tests. |
 | [`build.rs`](build.rs), [`tools/winres.rs`](tools/winres.rs) | Put the app icon into the exe by writing the resource object directly, so no resource compiler is needed. |
 | [`installer/`](installer/) | The installer: carries the app, installs it for the current user, and uninstalls it. |
 
-The Persian font and the sound (`assets/sounds/notification.wav`, played with `PlaySound`) are
+The Persian font and the sounds (`layout.wav`, `typo.wav`, and `password-layout.wav` in `assets/sounds/`, played with `PlaySound`) are
 embedded in the exe; the font is registered only for this process, so nothing is installed on your
 system. English uses Segoe UI, which comes with Windows.
 
@@ -268,7 +359,6 @@ test cases and the overall design of the key tracker come from ZabanYar. Thank y
 - Word frequencies: **[wordfreq](https://github.com/rspeer/wordfreq)** by Robyn Speer (CC BY-SA 4.0)
 - Font: **[Vazirmatn](https://github.com/rastikerdar/vazirmatn)** by Saber Rastikerdar and the
   Vazirmatn Project Authors (OFL 1.1)
-- Notification sound: "Notification Alert Warning" from **[Tunetank](https://tunetank.com)**
 
 ## License
 

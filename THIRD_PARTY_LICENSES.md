@@ -54,9 +54,13 @@ The Persian font is embedded in the exe and registered privately for the app onl
 
 The font file is unmodified. English text uses Segoe UI, which ships with Windows and is not bundled.
 
-## Notification sound
+## Notification sounds
 
-`assets/sounds/notification.wav` is "Notification Alert Warning" from
+`assets/sounds/layout.wav` (wrong keyboard layout), `assets/sounds/typo.wav` (spelling), and
+`assets/sounds/password-layout.wav` (password and number fields) are embedded in the app, unmodified, as supplied by the project owner (TODO: record their source and
+license before release).
+
+`assets/sounds/notification.wav` is no longer embedded in the app. It is "Notification Alert Warning" from
 **[Tunetank](https://tunetank.com)** (file `tunetank.com_notification-alert-warning.wav`, © 2023),
 used under the Tunetank license (TODO: confirm the license terms and any attribution they ask for).
 Changes: trimmed to 0–1.81 s with a 0.1 s fade-out, mixed down to 16-bit 44.1 kHz mono WAV, tags

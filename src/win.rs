@@ -15,9 +15,7 @@
 use std::cell::RefCell;
 use windows::core::{Interface, VARIANT};
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
-use windows::Win32::UI::Accessibility::{
-    AccessibleObjectFromEvent, AccessibleObjectFromWindow, IAccessible, SetWinEventHook, HWINEVENTHOOK,
-};
+use windows::Win32::UI::Accessibility::{AccessibleObjectFromWindow, IAccessible};
 use std::time::{Duration, Instant};
 
 use windows::Win32::Media::Audio::{PlaySoundW, SND_ASYNC, SND_MEMORY, SND_NODEFAULT};
@@ -33,10 +31,16 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::Win32::System::Threading::CreateMutexW;
 
 use crate::detect::{self, Confidence, Lang};
+use crate::fields;
 use crate::mapping;
-use crate::settings;
+use crate::panel;
+use crate::settings::{self, FieldAction};
+use crate::spell::{self, Suggestion};
+use crate::suggest;
 use crate::theme;
 use crate::tray;
+use crate::userwords;
+use crate::words;
 
 // ------------------------------------------------------------------ settings ---
 // On/off, auto-fix and sound are runtime settings in the tray menu (tray.rs).
@@ -52,6 +56,8 @@ const TAB_ACCEPTS: bool = true;
 /// Check an unfinished word after this pause (search boxes have no Space).
 const IDLE_MS: u32 = 1100;
 const BUBBLE_MS: u32 = 5000;
+/// How long after an auto-fix Pause, Right Ctrl or Ctrl+Z still counts as undoing it.
+const UNDO_WINDOW: Duration = Duration::from_secs(20);
 
 const VK_TAB_CODE: u32 = 0x09;
 const VK_RCTRL_CODE: u32 = 0xA3;
@@ -62,8 +68,16 @@ const WM_APP_TYPED: u32 = WM_APP + 2; // a letter was typed
 const WM_APP_HOTKEY: u32 = WM_APP + 3;
 const WM_APP_RESET: u32 = WM_APP + 4; // click / focus change / arrows...
 const WM_APP_ESCAPE: u32 = WM_APP + 5;
+const WM_APP_SPELL: u32 = WM_APP + 6; // the spelling thread has a reply
+pub(crate) const WM_APP_SPELL_PICK: u32 = WM_APP + 7; // a row was clicked (wparam)
+pub(crate) const WM_APP_SPELL_HOVER: u32 = WM_APP + 8; // the mouse is on a row (wparam)
+const WM_APP_SPELL_ACCEPT: u32 = WM_APP + 9; // Tab, or Space after arrows (wparam 1)
+const WM_APP_SPELL_MOVE: u32 = WM_APP + 10; // Up (wparam 1) / Down (wparam 0)
+const WM_APP_FIELD: u32 = WM_APP + 11; // focus moved (wparam = fields::FLAG_*)
+const WM_APP_UNDO: u32 = WM_APP + 12; // Ctrl+Z right after an auto-fix
 const TIMER_IDLE: usize = 1;
 const TIMER_HIDE: usize = 2;
+const TIMER_SPELL: usize = 3;
 
 // --------------------------------------------------------------------- state ---
 struct Key {
@@ -71,6 +85,8 @@ struct Key {
     fa: String,
     lang: Lang,
     sep: bool,
+    /// The user rejected converting this word: later hints leave it out.
+    kept: bool,
 }
 
 impl Key {
@@ -87,7 +103,7 @@ impl Key {
         let sep = !en.chars().chain(fa.chars()).any(|c| {
             c.is_alphanumeric() || matches!(c, '\u{200c}' | '\u{200d}' | '\u{0300}'..='\u{036f}' | '\u{064b}'..='\u{065f}')
         });
-        Key { en, fa, lang, sep }
+        Key { en, fa, lang, sep, kept: false }
     }
     fn is_space(&self) -> bool {
         self.en == " "
@@ -104,6 +120,49 @@ struct Bubble {
     rect: RECT,
     /// The caret it was placed for.
     caret: RECT,
+    /// The word this hint is about, when it covers exactly one.
+    candidate: Option<Candidate>,
+}
+
+/// A single word that a hint or auto-fix wanted to convert: `run[start..end]`,
+/// as typed. Rejecting it enough times makes it a valid word.
+#[derive(Clone)]
+struct Candidate {
+    start: usize,
+    end: usize,
+    generation: usize,
+    lang: Lang,
+    word: String,
+}
+
+/// The newest auto-fix, until something is typed after it.
+struct AutoFix {
+    start: usize,
+    seq: u64,
+    generation: usize,
+    at: Instant,
+    /// The layout the text was typed in.
+    typed: Lang,
+    candidate: Option<Candidate>,
+}
+
+/// A finished word being spell-checked: `run[start..end]` reads `word`.
+struct SpellTarget {
+    start: usize,
+    end: usize,
+    generation: usize,
+    lang: Lang,
+    word: String,
+}
+
+/// The suggestion list on screen.
+struct SpellChoice {
+    target: SpellTarget,
+    items: Vec<Suggestion>,
+    selected: usize,
+    rect: RECT,
+    /// The arrow keys were used, and nothing else typed since: Space accepts.
+    navigated: bool,
 }
 
 struct State {
@@ -126,15 +185,34 @@ struct State {
     bubble: Option<Bubble>,
     /// Language the previous word was corrected to, and when.
     last_fix: Option<(Lang, Instant)>,
-    /// The focused control is a password field: keys are not recorded.
-    in_password: bool,
+    /// The focused control, to notice focus moving inside a window.
+    control: isize,
+    /// Keys of the current word went unrecorded: leave it alone until Space.
+    skip_word: bool,
+    /// The suggestion list, while it is showing.
+    spell: Option<SpellChoice>,
+    /// The newest word sent to the spelling thread.
+    spell_pending: Option<(u64, SpellTarget)>,
+    spell_service: Option<spell::Service>,
+    spell_next: u64,
+    /// End of the last Shift+Space. It may have typed a half-space, which the
+    /// run records as a space, so text up to here can't be safely retyped.
+    spell_barrier: usize,
+    auto_fix: Option<AutoFix>,
+    /// An auto-fix undone with Ctrl+Z, for the window procedure to finish.
+    undone: Option<AutoFix>,
 }
 
 /// What the window procedure must do once the state borrow is released.
 enum Action {
     None,
-    Show { text: String, target: Lang, start: usize },
+    Show { text: String, target: Lang, start: usize, candidate: Option<Candidate> },
     Convert { backspaces: usize, text: String, switch_to: Option<(HKL, HWND)> },
+    ShowSpell { items: Vec<Suggestion>, rtl: bool },
+    SelectSpell(usize),
+    HideSpell,
+    /// Apply a spelling fix: no layout switch.
+    Replace { backspaces: usize, text: String },
 }
 
 thread_local! {
@@ -322,7 +400,7 @@ const EDGE_MARGIN: i32 = 8;
 /// the line being typed nor the text already written. If that would put it
 /// off-screen or under the taskbar, it flips above the caret and/or to the
 /// other side; if neither fits it is pushed inside the edges.
-fn place_bubble(caret: RECT, w: i32, h: i32, work: RECT, rtl_text: bool) -> (i32, i32) {
+pub(crate) fn place_bubble(caret: RECT, w: i32, h: i32, work: RECT, rtl_text: bool) -> (i32, i32) {
     let (min_x, max_x) = (work.left + EDGE_MARGIN, work.right - EDGE_MARGIN - w);
     let (min_y, max_y) = (work.top + EDGE_MARGIN, work.bottom - EDGE_MARGIN - h);
     let clamp = |v: i32, lo: i32, hi: i32| v.min(hi).max(lo);
@@ -378,14 +456,55 @@ fn with_leading_punct(run: &[Key], mut start: usize) -> usize {
 // --------------------------------------------------------------------- hooks ---
 impl State {
     fn reset(&mut self) {
+        self.skip_word = false;
+        self.forget_text();
+    }
+
+    /// Clears everything held from what was typed and closes the popups.
+    fn forget_text(&mut self) {
         self.run.clear();
+        self.spell_barrier = 0;
+        self.spell_pending = None;
+        self.auto_fix = None;
         self.seq += 1;
         self.generation += 1;
         post(self.window, WM_APP_RESET, 0, 0);
     }
 
+    /// A key in a field not confirmed safe: it is not looked at, and text
+    /// from before it is dropped because focus may have moved.
+    fn drop_key(&mut self) {
+        self.skip_word = true;
+        self.undone = None;
+        if !self.run.is_empty() || self.bubble.is_some() || self.spell.is_some() || self.auto_fix.is_some() {
+            self.forget_text();
+        }
+    }
+
     /// Returns true to swallow the key.
     fn on_key(&mut self, vk: u32, scan: u32) -> bool {
+        // The gate: nothing past it runs for a key unless the field is confirmed safe.
+        let (hwnd, tid) = foreground();
+        let control = fields::focused_control(tid);
+        if hwnd != self.foreground || control != self.control {
+            self.foreground = hwnd;
+            self.control = control;
+            // the watcher has usually confirmed the new control by now
+            if !fields::is_safe_for(control) {
+                fields::poke();
+            }
+            self.reset();
+        }
+        if panel::is_panel(hwnd) || words::owns(hwnd) {
+            self.rctrl_alone = false;
+            return false; // keys in TypeFlow's own windows are not typing
+        }
+        if !fields::is_safe_for(control) {
+            self.rctrl_alone = false;
+            self.drop_key();
+            return false;
+        }
+
         if vk == VK_RCTRL_CODE {
             if !self.rctrl_down {
                 self.rctrl_down = true; // ignore auto-repeat
@@ -394,16 +513,7 @@ impl State {
             return false;
         }
         self.rctrl_alone = false;
-
-        let (hwnd, tid) = foreground();
-        if hwnd != self.foreground {
-            self.foreground = hwnd;
-            self.reset();
-        }
-        if self.in_password {
-            return false; // never record what is typed into a password field
-        }
-        if vk == HOTKEY_VK {
+        if vk == HOTKEY_VK && tray::get(&tray::ENABLED) {
             post(self.window, WM_APP_HOTKEY, 0, 0);
             return true;
         }
@@ -412,10 +522,38 @@ impl State {
             post(self.window, WM_APP_HOTKEY, 0, 0);
             return true;
         }
+        // the suggestion list: a layout hint always comes first (above)
+        if self.spell.is_some() && !shortcut {
+            if vk == VK_TAB_CODE {
+                post(self.window, WM_APP_SPELL_ACCEPT, 0, 0);
+                return true;
+            }
+            if (vk == VK_UP.0 as u32 || vk == VK_DOWN.0 as u32) && !key_down(VK_SHIFT) {
+                post(self.window, WM_APP_SPELL_MOVE, (vk == VK_UP.0 as u32) as usize, 0);
+                return true;
+            }
+            if vk == 0x20 && !key_down(VK_SHIFT) && self.spell.as_ref().is_some_and(|c| c.navigated) {
+                post(self.window, WM_APP_SPELL_ACCEPT, 1, 0);
+                return true;
+            }
+        }
         if is_modifier_vk(vk) {
             return false;
         }
+        // typing on after using the arrows: Space is an ordinary space again
+        if let Some(c) = &mut self.spell {
+            c.navigated = false;
+        }
         if shortcut {
+            if vk == 0x5A && key_down(VK_CONTROL) && !key_down(VK_SHIFT) && !key_down(VK_MENU) {
+                // no file access in the hook: the window procedure finishes this
+                if let Some(fix) = self.fresh_auto_fix() {
+                    self.undone = Some(fix);
+                    post(self.window, WM_APP_UNDO, 0, 0);
+                }
+            } else {
+                fields::poke(); // any other shortcut can move focus
+            }
             self.reset(); // shortcuts (Ctrl+V, Alt+Tab...) make our copy of the text unreliable
             return false;
         }
@@ -429,15 +567,39 @@ impl State {
             }
         }
 
+        // A PIN, one-time code or card number can sit in a plain text box.
+        // Digits are never converted anyway, so they are never recorded.
+        if (0x30..=0x39).contains(&vk) && !key_down(VK_SHIFT) {
+            self.skip_word = true;
+            if !self.run.is_empty() {
+                self.forget_text();
+            }
+            return false;
+        }
+        // part of this word went unrecorded, so it can't be judged or retyped
+        if self.skip_word {
+            if vk == 0x20 {
+                self.skip_word = false;
+                return false;
+            }
+            if is_typing_vk(vk) {
+                return false;
+            }
+        }
+
         match vk {
             0x08 /* Backspace */ => {
                 self.run.pop();
+                self.spell_barrier = self.spell_barrier.min(self.run.len());
                 self.seq += 1;
                 return false;
             }
             0x20 /* Space */ => {
                 let lang = lang.unwrap_or(Lang::En);
                 self.run.push(Key::new(" ".into(), " ".into(), lang));
+                if key_down(VK_SHIFT) {
+                    self.spell_barrier = self.run.len();
+                }
                 self.seq += 1;
                 // pass where this word ends: by the time the message is handled,
                 // a fast typist may already be in the middle of the next word
@@ -451,6 +613,9 @@ impl State {
             _ => {}
         }
         let Some(lang) = lang.filter(|_| is_typing_vk(vk)) else {
+            if vk == VK_TAB_CODE || vk == VK_RETURN.0 as u32 {
+                fields::poke(); // these often move focus to the next field
+            }
             self.reset(); // arrows, Enter, Tab, Home, or a third layout
             return false;
         };
@@ -480,6 +645,7 @@ impl State {
         };
         if self.run.len() > 400 {
             self.run.drain(..200);
+            self.spell_barrier = self.spell_barrier.saturating_sub(200);
             self.generation += 1;
             self.bubble = None;
         }
@@ -495,7 +661,7 @@ impl State {
 
     fn on_key_up(&mut self, vk: u32) {
         if vk == VK_RCTRL_CODE {
-            if RCTRL_TAP && self.rctrl_alone {
+            if RCTRL_TAP && self.rctrl_alone && tray::get(&tray::ENABLED) && fields::is_safe() {
                 post(self.window, WM_APP_HOTKEY, 0, 0);
             }
             self.rctrl_down = false;
@@ -503,15 +669,17 @@ impl State {
         }
     }
 
+    /// `pt` is on the hint or the suggestion list. They never take focus.
+    fn on_own_popup(&self, pt: POINT) -> bool {
+        let on = |r: RECT| (r.left..r.right).contains(&pt.x) && (r.top..r.bottom).contains(&pt.y);
+        self.bubble.as_ref().is_some_and(|b| on(b.rect)) || self.spell.as_ref().is_some_and(|c| on(c.rect))
+    }
+
     fn on_click(&mut self, pt: POINT) {
         self.rctrl_alone = false; // Ctrl+click is not a tap
-        if let Some(b) = &self.bubble {
-            let r = b.rect;
-            if (r.left..=r.right).contains(&pt.x) && (r.top..=r.bottom).contains(&pt.y) {
-                return; // a click on our own bubble keeps the text
-            }
+        if !self.on_own_popup(pt) {
+            self.reset();
         }
-        self.reset();
     }
 
     // -------------------------------------------------------------- decisions ---
@@ -535,7 +703,7 @@ impl State {
                 break;
             }
             let lang = self.run[s].lang;
-            if self.run[s..e].iter().any(|k| k.lang != lang) || typed.is_some_and(|t| t != lang) {
+            if self.run[s..e].iter().any(|k| k.lang != lang || k.kept) || typed.is_some_and(|t| t != lang) {
                 break;
             }
             typed = Some(lang);
@@ -578,14 +746,34 @@ impl State {
             verdict.confidence
         );
 
+        // only a verdict on one word says anything about that word
+        let (word_start, word_end) = spans[spans.len() - 1];
+        let mut candidate = (verdict.first + 1 == spans.len()).then(|| Candidate {
+            start: word_start,
+            end: word_end,
+            generation: self.generation,
+            lang: typed,
+            word: self.text_of(word_start, word_end),
+        });
+
         if tray::get(&tray::AUTO_FIX) && verdict.confidence == Confidence::Sure {
-            return self.convert_from(start, target);
+            let action = self.convert_from(start, target);
+            self.auto_fix = Some(AutoFix {
+                start,
+                seq: self.seq,
+                generation: self.generation,
+                at: Instant::now(),
+                typed,
+                candidate,
+            });
+            return action;
         }
 
         // an earlier word in the same direction is still waiting: extend the hint
         if let Some(b) = &self.bubble {
             if b.target == target && b.start < start {
                 start = b.start;
+                candidate = None;
             }
         }
         let wrong = target.other();
@@ -596,7 +784,7 @@ impl State {
             .trim()
             .to_string();
         let text = if target == Lang::Fa { mapping::normalize_fa(&text) } else { text };
-        Action::Show { text, target, start }
+        Action::Show { text, target, start, candidate }
     }
 
     /// Retype everything from `run[start..]` so keys typed in the wrong layout
@@ -615,34 +803,283 @@ impl State {
         let backspaces = tail.len();
         self.bubble = None;
 
+        let switch_to = self.layout_switch(target);
+        Action::Convert { backspaces, text, switch_to }
+    }
+
+    /// The layout to switch to, remembered as pending until the app applies it.
+    fn layout_switch(&mut self, target: Lang) -> Option<(HKL, HWND)> {
         let hkl = match target {
             Lang::En => self.en_hkl,
             Lang::Fa => self.fa_hkl,
         };
-        let switch_to = hkl.filter(|_| SWITCH_LAYOUT).map(|h| {
+        hkl.filter(|_| SWITCH_LAYOUT).map(|h| {
             self.pending = Some((target, self.foreground, Instant::now() + Duration::from_secs(2)));
             (h, self.foreground)
-        });
-        Action::Convert { backspaces, text, switch_to }
+        })
     }
 
-    fn on_hotkey(&mut self) -> Action {
+    /// The hotkey or a click on the hint. Also returns a word the user just
+    /// rejected by undoing its auto-fix.
+    fn on_hotkey(&mut self) -> (Action, Option<Candidate>) {
         if let Some(b) = &self.bubble {
             let (start, target) = (b.start, b.target);
-            return self.convert_from(start, target);
+            if let Some(c) = &b.candidate {
+                userwords::accepted(c.lang, &c.word);
+            }
+            return (self.convert_from(start, target), None);
+        }
+        if let Some(fix) = self.fresh_auto_fix() {
+            self.last_fix = None;
+            let action = self.convert_from(fix.start, fix.typed);
+            for k in &mut self.run[fix.start..] {
+                k.kept = true;
+            }
+            return (action, fix.candidate);
         }
         let (start, end) = last_word_span(&self.run, true);
         if start == end {
-            return Action::None;
+            return (Action::None, None);
         }
         let target = self.run[start].lang.other();
-        self.convert_from(with_leading_punct(&self.run, start), target)
+        (self.convert_from(with_leading_punct(&self.run, start), target), None)
+    }
+
+    /// The last auto-fix, if nothing has been typed since and it's recent.
+    fn fresh_auto_fix(&mut self) -> Option<AutoFix> {
+        let fix = self.auto_fix.take()?;
+        (fix.seq == self.seq && fix.generation == self.generation && fix.at.elapsed() < UNDO_WINDOW).then_some(fix)
+    }
+
+    /// The word of a hint that is going away unused. With `typed_on` it only
+    /// counts if the user carried on typing after it, since a hint that merely
+    /// timed out may never have been seen. A word the user went back and
+    /// changed doesn't count: that means the hint was right.
+    fn rejected_hint(&mut self, typed_on: bool) -> Option<Candidate> {
+        let c = self.bubble.as_ref()?.candidate.clone()?;
+        let intact = c.generation == self.generation
+            && c.end <= self.run.len()
+            && self.text_of(c.start, c.end) == c.word
+            && self.run.get(c.end).map_or(true, Key::is_sep);
+        if !intact || (typed_on && self.run[c.end..].iter().all(Key::is_sep)) {
+            return None;
+        }
+        for k in &mut self.run[c.start..c.end] {
+            k.kept = true;
+        }
+        Some(c)
+    }
+
+    // --------------------------------------------------------------- spelling ---
+
+    fn text_of(&self, start: usize, end: usize) -> String {
+        self.run[start..end].iter().map(|k| k.text(k.lang)).collect()
+    }
+
+    /// The word finished by the Space at `run[end - 1]`, with what its keys
+    /// spell in the other layout. Only plain words qualify: anything glued to
+    /// other symbols (URLs, emails, paths, code), numbers, ALL CAPS, mixedCase,
+    /// and capitalized names in mid-sentence are left alone.
+    fn spell_target(&self, end: usize) -> Option<(SpellTarget, String)> {
+        let end = end.min(self.run.len());
+        if end == 0 || !self.run[end - 1].is_space() {
+            return None;
+        }
+        let token_end = end - 1;
+        let mut token_start = token_end;
+        while token_start > 0 && !self.run[token_start - 1].is_space() {
+            token_start -= 1;
+        }
+        if token_start == token_end || (self.spell_barrier > token_start && self.spell_barrier <= end) {
+            return None;
+        }
+        let keys = &self.run[token_start..token_end];
+        let lang = keys[0].lang;
+        if keys.iter().any(|k| k.lang != lang || k.text(lang).chars().count() != 1) {
+            return None;
+        }
+        let chars: Vec<char> = keys.iter().filter_map(|k| k.text(lang).chars().next()).collect();
+        let (mut a, mut b) = (0, chars.len());
+        while a < b && "\"'([{«“‘".contains(chars[a]) {
+            a += 1;
+        }
+        while b > a && "\"')]}»”’.,!?:;،؛؟…".contains(chars[b - 1]) {
+            b -= 1;
+        }
+        let word = &chars[a..b];
+        let letters = word.iter().filter(|c| c.is_alphabetic()).count();
+        if letters < spell::MIN_LETTERS {
+            return None;
+        }
+        match lang {
+            Lang::En => {
+                let edge = |c: &char| c.is_ascii_alphabetic();
+                if !word.iter().all(|c| c.is_ascii_alphabetic() || *c == '\'')
+                    || !word.first().is_some_and(edge)
+                    || !word.last().is_some_and(edge)
+                    || word[1..].iter().any(char::is_ascii_uppercase)
+                {
+                    return None;
+                }
+                if word[0].is_ascii_uppercase() {
+                    let before = self.run[..token_start].iter().rev().find(|k| !k.is_space());
+                    let sentence_start =
+                        before.map_or(true, |k| k.text(k.lang).chars().last().is_some_and(|c| ".!?؟:".contains(c)));
+                    if !sentence_start {
+                        return None;
+                    }
+                }
+            }
+            Lang::Fa => {
+                if !word.iter().all(|c| mapping::is_persian_char(*c)) {
+                    return None;
+                }
+            }
+        }
+        let other: String = keys[a..b].iter().map(|k| k.text(lang.other())).collect();
+        let target = SpellTarget {
+            start: token_start + a,
+            end: token_start + b,
+            generation: self.generation,
+            lang,
+            word: word.iter().collect(),
+        };
+        Some((target, other))
+    }
+
+    /// Sends the word just finished to the spelling thread.
+    fn request_spelling(&mut self, end: usize) {
+        if self.bubble.is_some() || !fields::is_safe() {
+            return; // a layout hint always comes first
+        }
+        let Some((target, other)) = self.spell_target(end) else { return };
+        if !spell_enabled(target.lang) || userwords::contains(target.lang, &detect::lookup_key(target.lang, &target.word)) {
+            return;
+        }
+        let Some(service) = &self.spell_service else { return };
+        self.spell_next += 1;
+        service.check(self.spell_next, target.lang, target.word.clone(), other);
+        self.spell_pending = Some((self.spell_next, target));
+    }
+
+    /// The word is still exactly where it was when it was checked.
+    fn is_current(&self, t: &SpellTarget) -> bool {
+        t.generation == self.generation && t.end <= self.run.len() && self.text_of(t.start, t.end) == t.word
+    }
+
+    fn on_spell_reply(&mut self) -> Action {
+        let mut action = Action::None;
+        while let Some(reply) = self.spell_service.as_ref().and_then(|s| s.next_reply()) {
+            if self.spell_pending.as_ref().map(|p| p.0) != Some(reply.id) {
+                continue; // a newer word has been typed since
+            }
+            let Some((_, target)) = self.spell_pending.take() else { continue };
+            if reply.suggestions.is_empty()
+                || self.bubble.is_some()
+                || !fields::is_safe()
+                || !spell_enabled(target.lang)
+                || !self.is_current(&target)
+            {
+                continue;
+            }
+            let rtl = target.lang == Lang::Fa;
+            let items = reply.suggestions;
+            self.spell = Some(SpellChoice { target, items: items.clone(), selected: 0, rect: RECT::default(), navigated: false });
+            action = Action::ShowSpell { items, rtl };
+        }
+        action
+    }
+
+    fn move_spell(&mut self, up: bool) -> Action {
+        let Some(c) = &mut self.spell else { return Action::None };
+        let n = c.items.len();
+        c.selected = if up { (c.selected + n - 1) % n } else { (c.selected + 1) % n };
+        c.navigated = true;
+        Action::SelectSpell(c.selected)
+    }
+
+    fn hover_spell(&mut self, row: usize) -> Action {
+        match &mut self.spell {
+            Some(c) if row < c.items.len() => {
+                c.selected = row;
+                Action::SelectSpell(row)
+            }
+            _ => Action::None,
+        }
+    }
+
+    /// Replaces the word with the selected suggestion and retypes whatever
+    /// was typed after it. With `add_space`, the text ends in exactly one
+    /// space: the one that finished the word counts.
+    fn accept_spell(&mut self, add_space: bool) -> Action {
+        let Some(choice) = self.spell.take() else { return Action::None };
+        let t = &choice.target;
+        if !self.is_current(t) || self.spell_barrier > t.end {
+            return Action::HideSpell;
+        }
+        let tail = &self.run[t.end..];
+        if tail.iter().any(|k| k.text(k.lang).chars().count() != 1) {
+            return Action::HideSpell;
+        }
+        let tail_text: String = tail.iter().map(|k| k.text(k.lang)).collect();
+        let replacement = &choice.items[choice.selected].word;
+        let backspaces = self.run.len() - t.start;
+        let keys: Vec<Key> = replacement.chars().map(|c| spelled_key(c, t.lang)).collect();
+        let mut text = format!("{replacement}{tail_text}");
+        self.run.splice(t.start..t.end, keys);
+        if add_space && !tail_text.ends_with(' ') {
+            text.push(' ');
+            self.run.push(Key::new(" ".into(), " ".into(), t.lang));
+        }
+        self.generation += 1; // indices after the word have moved
+        self.seq += 1;
+        Action::Replace { backspaces, text }
+    }
+}
+
+fn spell_enabled(lang: Lang) -> bool {
+    tray::get(match lang {
+        Lang::En => &tray::AUTOCORRECT_EN,
+        Lang::Fa => &tray::AUTOCORRECT_FA,
+    })
+}
+
+/// Counts a rejected hint or auto-fix, if learning is on.
+fn learn_rejection(candidate: Option<Candidate>) {
+    let Some(c) = candidate else { return };
+    if tray::get(&tray::LEARN_WORDS) && fields::is_safe() && userwords::reject(c.lang, &c.word) {
+        userwords::save();
+        words::refresh();
+        panel::refresh();
+    }
+}
+
+/// The installed keyboard layout for `lang`.
+pub(crate) fn layout_for(lang: Lang) -> Option<HKL> {
+    with_state(|s| {
+        if s.en_hkl.is_none() || s.fa_hkl.is_none() {
+            (s.en_hkl, s.fa_hkl) = installed_layouts();
+        }
+        match lang {
+            Lang::En => s.en_hkl,
+            Lang::Fa => s.fa_hkl,
+        }
+    })
+    .flatten()
+}
+
+/// A key for a corrected letter, so later layout conversions still work.
+fn spelled_key(c: char, lang: Lang) -> Key {
+    let s = c.to_string();
+    match lang {
+        Lang::En => Key::new(s.clone(), mapping::en_to_fa(&s), lang),
+        Lang::Fa => Key::new(mapping::fa_to_en(&s), s, lang),
     }
 }
 
 unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     let msg = wparam.0 as u32;
-    if code == HC_ACTION as i32 && tray::get(&tray::ENABLED) {
+    if code == HC_ACTION as i32 && tray::active() {
         let k = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
         // ignore keys we inject ourselves with SendInput
         if k.flags.0 & LLKHF_INJECTED.0 == 0 {
@@ -658,42 +1095,47 @@ unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARA
     CallNextHookEx(HHOOK::default(), code, wparam, lparam)
 }
 
-/// Focus moved: if it landed in a password field, stop recording keys, and
-/// beep when the keyboard is not English, before the user starts typing.
-unsafe extern "system" fn focus_event(
-    _hook: HWINEVENTHOOK, _event: u32, hwnd: HWND, id_object: i32, id_child: i32, _thread: u32, _time: u32,
-) {
-    if id_object != OBJID_CLIENT.0 || !tray::get(&tray::ENABLED) {
+/// Focus just entered a password or number field. If the keyboard isn't
+/// English, play the sound and, if set to, switch it.
+fn on_field_entered() {
+    let action = tray::field_action();
+    if action == FieldAction::Disable {
         return;
     }
-    let protected = is_password_field(hwnd, id_object, id_child);
-    let was = with_state(|s| std::mem::replace(&mut s.in_password, protected)).unwrap_or(false);
-    if protected && !was {
-        let (_, tid) = foreground();
-        if lang_of(GetKeyboardLayout(layout_thread(tid))) != Some(Lang::En) {
-            ding();
+    let (window, thread) = foreground();
+    if panel::is_panel(window) || words::owns(window) || lang_of(unsafe { GetKeyboardLayout(layout_thread(thread)) }) == Some(Lang::En) {
+        return;
+    }
+    play_now(FIELD_WAV);
+    if action != FieldAction::English {
+        return;
+    }
+    let english = with_state(|s| {
+        if s.en_hkl.is_none() {
+            (s.en_hkl, s.fa_hkl) = installed_layouts();
         }
-    }
-}
-
-/// True when the focused accessible element is marked "protected" (password).
-unsafe fn is_password_field(hwnd: HWND, id_object: i32, id_child: i32) -> bool {
-    const STATE_SYSTEM_PROTECTED: i32 = 0x2000_0000;
-    let mut acc: Option<IAccessible> = None;
-    let mut child = VARIANT::default();
-    if AccessibleObjectFromEvent(hwnd, id_object as u32, id_child as u32, &mut acc, &mut child).is_err() {
-        return false;
-    }
-    let Some(acc) = acc else { return false };
-    match acc.get_accState(&child) {
-        Ok(v) => i32::try_from(&v).map_or(false, |st| st & STATE_SYSTEM_PROTECTED != 0),
-        Err(_) => false,
+        if s.en_hkl.is_some() {
+            s.pending = Some((Lang::En, window, Instant::now() + Duration::from_secs(2)));
+        }
+        s.en_hkl
+    })
+    .flatten();
+    if let Some(hkl) = english {
+        unsafe {
+            let _ = PostMessageW(window, WM_INPUTLANGCHANGEREQUEST, WPARAM(0), LPARAM(hkl.0 as isize));
+        }
     }
 }
 
 unsafe extern "system" fn mouse_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     let msg = wparam.0 as u32;
-    if code == HC_ACTION as i32 && tray::get(&tray::ENABLED) && (msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN) {
+    if code == HC_ACTION as i32 && (msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN) {
+        let m = &*(lparam.0 as *const MSLLHOOKSTRUCT);
+        if !with_state(|s| s.on_own_popup(m.pt)).unwrap_or(false) {
+            fields::poke(); // a click may have moved focus
+        }
+    }
+    if code == HC_ACTION as i32 && tray::active() && (msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN) {
         let m = &*(lparam.0 as *const MSLLHOOKSTRUCT);
         with_state(|s| s.on_click(m.pt));
     }
@@ -717,7 +1159,7 @@ const FONT_FILES: [&[u8]; 1] = [include_bytes!("../assets/fonts/Vazirmatn-RD-Lig
 const FA_FONT: PCWSTR = w!("Vazirmatn RD Light");
 const EN_FONT: PCWSTR = w!("Segoe UI");
 
-fn load_fonts() {
+pub(crate) fn load_fonts() {
     for data in FONT_FILES {
         let mut count = 0u32;
         unsafe {
@@ -743,15 +1185,26 @@ impl Fonts {
     }
 }
 
-/// "Notification Alert Warning" from Tunetank, trimmed and converted to 16-bit
-/// mono WAV (see assets/sounds/ and THIRD_PARTY_LICENSES.md).
-static DING_WAV: &[u8] = include_bytes!("../assets/sounds/notification.wav");
+/// Played when the keyboard layout looks wrong (see THIRD_PARTY_LICENSES.md).
+static LAYOUT_WAV: &[u8] = include_bytes!("../assets/sounds/layout.wav");
+/// Played when the suggestion list opens for a typo.
+static TYPO_WAV: &[u8] = include_bytes!("../assets/sounds/typo.wav");
 
-fn ding() {
+/// Played when a password or number field opens with a non-English keyboard.
+/// It has its own setting, so the Sound switch doesn't apply to it.
+static FIELD_WAV: &[u8] = include_bytes!("../assets/sounds/password-layout.wav");
+
+/// Plays a sound unless Sound is off.
+fn play(sound: &'static [u8]) {
     if tray::get(&tray::DING) {
-        unsafe {
-            let _ = PlaySoundW(PCWSTR(DING_WAV.as_ptr() as *const u16), None, SND_MEMORY | SND_ASYNC | SND_NODEFAULT);
-        }
+        play_now(sound);
+    }
+}
+
+/// The data must outlive the playback.
+fn play_now(sound: &'static [u8]) {
+    unsafe {
+        let _ = PlaySoundW(PCWSTR(sound.as_ptr() as *const u16), None, SND_MEMORY | SND_ASYNC | SND_NODEFAULT);
     }
 }
 
@@ -796,7 +1249,7 @@ fn line_flags(rtl: bool) -> DRAW_TEXT_FORMAT {
     }
 }
 
-fn show_bubble(window: HWND, text: &str, target: Lang, start: usize) {
+fn show_bubble(window: HWND, text: &str, target: Lang, start: usize, candidate: Option<Candidate>) {
     let rtl = target == Lang::Fa;
     let theme = theme::Theme::current();
     BUBBLE_TEXT.with(|b| *b.borrow_mut() = (text.to_string(), rtl, theme));
@@ -811,7 +1264,7 @@ fn show_bubble(window: HWND, text: &str, target: Lang, start: usize) {
         let rtl_text = target == Lang::En;
         let (x, y) = place_bubble(caret, width, height, work_area(caret), rtl_text);
         if existing.is_none() {
-            ding();
+            play(LAYOUT_WAV);
         }
         // corners are rounded by DWM (theme::apply), not a window region,
         // which would clip the glass
@@ -820,7 +1273,7 @@ fn show_bubble(window: HWND, text: &str, target: Lang, start: usize) {
         SetTimer(window, TIMER_HIDE, BUBBLE_MS, None);
 
         let rect = RECT { left: x, top: y, right: x + width, bottom: y + height };
-        with_state(|s| s.bubble = Some(Bubble { start, target, rect, caret }));
+        with_state(|s| s.bubble = Some(Bubble { start, target, rect, caret, candidate }));
     }
 }
 
@@ -906,10 +1359,23 @@ unsafe fn render_bubble(text: &str, rtl: bool, c: &theme::Colors) -> (i32, i32, 
 
 // -------------------------------------------------------------- window proc ---
 fn perform(window: HWND, action: Action) {
+    // focus may have moved since this was decided: never show or retype text then
+    let uses_text = matches!(
+        action,
+        Action::Show { .. } | Action::Convert { .. } | Action::ShowSpell { .. } | Action::Replace { .. }
+    );
+    if uses_text && !fields::is_safe() {
+        wipe_text(window);
+        return;
+    }
     match action {
         Action::None => {}
-        Action::Show { text, target, start } => show_bubble(window, &text, target, start),
+        Action::Show { text, target, start, candidate } => {
+            hide_spell(window); // one popup at a time, and layout comes first
+            show_bubble(window, &text, target, start, candidate);
+        }
         Action::Convert { backspaces, text, switch_to } => {
+            hide_spell(window);
             hide_bubble(window);
             send_unicode(&text, backspaces);
             if let Some((hkl, target_window)) = switch_to {
@@ -918,6 +1384,66 @@ fn perform(window: HWND, action: Action) {
                 }
             }
         }
+        Action::ShowSpell { items, rtl } => {
+            let caret = caret_rect();
+            let rect = suggest::show(window, &items, 0, rtl, caret, work_area(caret));
+            with_state(|s| {
+                if let (Some(c), Some(r)) = (&mut s.spell, rect) {
+                    c.rect = r;
+                }
+            });
+            play(TYPO_WAV);
+            unsafe { SetTimer(window, TIMER_SPELL, BUBBLE_MS, None) };
+        }
+        Action::SelectSpell(row) => {
+            suggest::select(row);
+            unsafe { SetTimer(window, TIMER_SPELL, BUBBLE_MS, None) };
+        }
+        Action::HideSpell => hide_spell(window),
+        Action::Replace { backspaces, text } => {
+            hide_spell(window);
+            send_unicode(&text, backspaces);
+        }
+    }
+}
+
+/// The field is no longer confirmed safe: keep nothing from it.
+fn wipe_text(window: HWND) {
+    with_state(|s| {
+        s.undone = None;
+        if !s.run.is_empty() || s.auto_fix.is_some() {
+            s.forget_text();
+        }
+    });
+    hide_bubble(window);
+    hide_spell(window);
+}
+
+fn hide_spell(window: HWND) {
+    with_state(|s| s.spell = None);
+    unsafe {
+        let _ = KillTimer(window, TIMER_SPELL);
+    }
+    suggest::hide();
+}
+
+/// Starts or frees the spelling thread's data to match the two switches.
+fn sync_spell() {
+    let on = tray::get(&tray::AUTOCORRECT_EN) || tray::get(&tray::AUTOCORRECT_FA);
+    with_state(|s| {
+        s.run.clear();
+        s.spell_barrier = 0;
+        s.spell_pending = None;
+        s.generation += 1;
+        if on {
+            let window = s.window;
+            s.spell_service.get_or_insert_with(|| spell::Service::start(window, WM_APP_SPELL)).wake();
+        } else if let Some(service) = &s.spell_service {
+            service.unload();
+        }
+    });
+    if let Some(window) = bubble_window() {
+        hide_spell(window);
     }
 }
 
@@ -937,6 +1463,7 @@ fn tray_command(tray_window: HWND, cmd: usize) {
             if !on {
                 if let Some(w) = bubble_window() {
                     hide_bubble(w);
+                    hide_spell(w);
                 }
             }
             tray::update(tray_window);
@@ -946,18 +1473,47 @@ fn tray_command(tray_window: HWND, cmd: usize) {
         }
         tray::CMD_DING => {
             if tray::toggle(&tray::DING) {
-                ding(); // let the user hear what they turned on
+                play(LAYOUT_WAV); // let the user hear what they turned on
             }
         }
+        tray::CMD_LEARN => {
+            if !tray::toggle(&tray::LEARN_WORDS) {
+                userwords::forget_rejections();
+            }
+        }
+        tray::CMD_WORDS => {
+            panel::hide();
+            words::show();
+            return;
+        }
         tray::CMD_AUTOSTART => sync_autostart(tray::toggle(&tray::START_WITH_WINDOWS)),
+        tray::CMD_AUTOCORRECT_EN => {
+            tray::toggle(&tray::AUTOCORRECT_EN);
+            sync_spell();
+        }
+        tray::CMD_AUTOCORRECT_FA => {
+            tray::toggle(&tray::AUTOCORRECT_FA);
+            sync_spell();
+        }
+        tray::CMD_FIELD_ENGLISH => tray::set_field_action(FieldAction::English),
+        tray::CMD_FIELD_NOTIFY => tray::set_field_action(FieldAction::Notify),
+        tray::CMD_FIELD_DISABLE => tray::set_field_action(FieldAction::Disable),
+        tray::CMD_OPEN => {
+            panel::show(tray_window);
+            return;
+        }
         tray::CMD_EXIT => unsafe {
+            panel::hide();
+            words::hide();
             tray::remove(tray_window);
             PostQuitMessage(0);
             return;
         },
         _ => return,
     }
+    fields::poke(); // the watcher may have been idle while everything was off
     settings::save(&tray::current());
+    panel::refresh();
 }
 
 /// Registers/unregisters the running exe to start at sign-in. Debug builds
@@ -975,13 +1531,17 @@ unsafe extern "system" fn window_proc(window: HWND, msg: u32, wparam: WPARAM, lp
     if is_tray_window {
         if msg == tray::WM_TRAY {
             match (lparam.0 as u32) & 0xFFFF {
-                WM_LBUTTONUP => tray_command(window, tray::CMD_ENABLED),
+                WM_LBUTTONUP => panel::toggle(window),
                 WM_RBUTTONUP | WM_CONTEXTMENU => {
                     let cmd = tray::show_menu(window);
                     tray_command(window, cmd);
                 }
                 _ => {}
             }
+            return LRESULT(0);
+        }
+        if msg == tray::WM_PANEL_COMMAND {
+            tray_command(window, wparam.0);
             return LRESULT(0);
         }
         if msg != 0 && msg == EXIT_REQUEST.with(|t| t.get()) {
@@ -999,33 +1559,119 @@ unsafe extern "system" fn window_proc(window: HWND, msg: u32, wparam: WPARAM, lp
         WM_APP_WORD => {
             let _ = KillTimer(window, TIMER_IDLE);
             let (end, generation) = (wparam.0, lparam.0 as usize);
+            if !fields::is_safe() {
+                wipe_text(window);
+                return LRESULT(0);
+            }
             let action = with_state(|s| {
                 // the text was cleared or shifted since that Space: indices are stale
-                if s.generation == generation { s.evaluate(end, false) } else { Action::None }
-            });
-            perform(window, action.unwrap_or(Action::None));
+                if s.generation == generation && tray::get(&tray::ENABLED) {
+                    s.evaluate(end, false)
+                } else {
+                    Action::None
+                }
+            })
+            .unwrap_or(Action::None);
+            // spelling only gets a word the layout check had nothing to say about
+            let layout_is_fine = matches!(action, Action::None);
+            perform(window, action);
+            if layout_is_fine {
+                with_state(|s| {
+                    if s.generation == generation {
+                        s.request_spelling(end);
+                    }
+                });
+            }
         }
         WM_APP_TYPED => {
-            SetTimer(window, TIMER_IDLE, IDLE_MS, None); // restarts on every key
+            if tray::get(&tray::ENABLED) {
+                SetTimer(window, TIMER_IDLE, IDLE_MS, None); // restarts on every key
+            }
         }
         WM_TIMER if wparam.0 == TIMER_IDLE => {
             let _ = KillTimer(window, TIMER_IDLE);
             let action = with_state(|s| {
                 let finished = s.run.last().map_or(true, |k| k.is_sep());
-                if finished { Action::None } else { s.evaluate(s.run.len(), true) }
+                if finished || !tray::get(&tray::ENABLED) || !fields::is_safe() {
+                    Action::None
+                } else {
+                    s.evaluate(s.run.len(), true)
+                }
             });
             perform(window, action.unwrap_or(Action::None));
         }
-        WM_TIMER if wparam.0 == TIMER_HIDE => hide_bubble(window),
-        WM_APP_HOTKEY | WM_LBUTTONDOWN => {
-            let action = with_state(|s| s.on_hotkey()).unwrap_or(Action::None);
+        WM_TIMER if wparam.0 == TIMER_HIDE => {
+            let rejected = with_state(|s| s.rejected_hint(true)).flatten();
+            hide_bubble(window);
+            learn_rejection(rejected);
+        }
+        WM_TIMER if wparam.0 == TIMER_SPELL => hide_spell(window),
+        WM_APP_SPELL => {
+            let action = with_state(|s| s.on_spell_reply()).unwrap_or(Action::None);
             perform(window, action);
+        }
+        WM_APP_FIELD => {
+            if wparam.0 & fields::FLAG_MOVED != 0 {
+                // a word cut off by the move can't be judged or retyped
+                with_state(|s| s.skip_word = s.run.last().is_some_and(|k| !k.is_sep()));
+                wipe_text(window);
+            } else if !fields::is_safe() {
+                wipe_text(window);
+            }
+            if wparam.0 & fields::FLAG_ENTERED != 0 {
+                on_field_entered();
+            }
+        }
+        WM_APP_SPELL_ACCEPT => {
+            let action = with_state(|s| s.accept_spell(wparam.0 == 1)).unwrap_or(Action::None);
+            perform(window, action);
+        }
+        WM_APP_SPELL_PICK => {
+            let action = with_state(|s| {
+                s.hover_spell(wparam.0);
+                s.accept_spell(false)
+            })
+            .unwrap_or(Action::None);
+            perform(window, action);
+        }
+        WM_APP_SPELL_HOVER => {
+            let action = with_state(|s| s.hover_spell(wparam.0)).unwrap_or(Action::None);
+            perform(window, action);
+        }
+        WM_APP_SPELL_MOVE => {
+            let action = with_state(|s| s.move_spell(wparam.0 == 1)).unwrap_or(Action::None);
+            perform(window, action);
+        }
+        WM_APP_HOTKEY | WM_LBUTTONDOWN => {
+            let (action, rejected) = with_state(|s| s.on_hotkey()).unwrap_or((Action::None, None));
+            perform(window, action);
+            learn_rejection(rejected);
+        }
+        WM_APP_UNDO => {
+            let undone = with_state(|s| {
+                let fix = s.undone.take()?;
+                let switch = s.layout_switch(fix.typed);
+                Some((fix.candidate, switch))
+            })
+            .flatten();
+            if let Some((candidate, switch)) = undone {
+                if let Some((hkl, target_window)) = switch {
+                    let _ = PostMessageW(target_window, WM_INPUTLANGCHANGEREQUEST, WPARAM(0), LPARAM(hkl.0 as isize));
+                }
+                learn_rejection(candidate);
+            }
         }
         WM_APP_RESET => {
             with_state(|s| s.last_fix = None);
             hide_bubble(window);
+            hide_spell(window);
         }
-        WM_APP_ESCAPE => hide_bubble(window),
+        WM_APP_ESCAPE => {
+            let rejected = with_state(|s| s.rejected_hint(false)).flatten();
+            hide_bubble(window);
+            hide_spell(window);
+            learn_rejection(rejected);
+        }
         WM_MOUSEACTIVATE => return LRESULT(MA_NOACTIVATE as isize),
         WM_PAINT => paint(window),
         _ => return DefWindowProcW(window, msg, wparam, lparam),
@@ -1048,6 +1694,7 @@ pub fn run() -> Result<()> {
         let saved = settings::load();
         tray::apply(&saved);
         settings::save(&saved);
+        userwords::load();
         sync_autostart(saved.start_with_windows); // also refreshes the exe path
 
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
@@ -1104,20 +1751,29 @@ pub fn run() -> Result<()> {
                 pending: None,
                 bubble: None,
                 last_fix: None,
-                in_password: false,
+                control: 0,
+                skip_word: false,
+                spell: None,
+                spell_pending: None,
+                spell_service: None,
+                spell_next: 0,
+                spell_barrier: 0,
+                auto_fix: None,
+                undone: None,
             })
         });
+        sync_spell();
 
         let _kb = SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook), instance, 0)?;
         let _mouse = SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook), instance, 0)?;
-        let _focus = SetWinEventHook(EVENT_OBJECT_FOCUS, EVENT_OBJECT_FOCUS, HMODULE::default(), Some(focus_event), 0, 0, WINEVENT_OUTOFCONTEXT);
+        fields::start(window, WM_APP_FIELD);
 
         // Debug builds: SMART_KEYBOARD_DEMO="سلام" shows that hint at startup,
         // to look at the glass without typing (simulated keys are ignored).
         #[cfg(debug_assertions)]
         if let Ok(demo) = std::env::var("SMART_KEYBOARD_DEMO") {
             let fa = demo.chars().any(|c| ('\u{0600}'..='\u{06FF}').contains(&c));
-            show_bubble(window, &demo, if fa { Lang::Fa } else { Lang::En }, 0);
+            show_bubble(window, &demo, if fa { Lang::Fa } else { Lang::En }, 0, None);
             if let Some(Some(b)) = with_state(|s| s.bubble.as_ref().map(|b| b.rect)) {
                 println!("demo bubble at {},{} {}x{}", b.left, b.top, b.right - b.left, b.bottom - b.top);
             }
@@ -1151,8 +1807,140 @@ mod tests {
             pending: None,
             bubble: None,
             last_fix: None,
-            in_password: false,
+            control: 0,
+            skip_word: false,
+            spell: None,
+            spell_pending: None,
+            spell_service: None,
+            spell_next: 0,
+            spell_barrier: 0,
+            auto_fix: None,
+            undone: None,
         }
+    }
+
+    // --------------------------------------------------------- secure fields ---
+    // These go through `on_key`, the code the real keyboard hook calls.
+    const KEY_A: (u32, u32) = (0x41, 0x1E);
+    const KEY_1: (u32, u32) = (0x31, 0x02);
+    const KEY_SPACE: (u32, u32) = (0x20, 0x39);
+
+    /// A state already settled on the current window, so the first key
+    /// doesn't count as a focus change.
+    fn settled() -> State {
+        let mut st = state();
+        let (hwnd, thread) = foreground();
+        st.foreground = hwnd;
+        st.control = fields::focused_control(thread);
+        st
+    }
+
+    fn press(st: &mut State, (vk, scan): (u32, u32)) {
+        st.on_key(vk, scan);
+    }
+
+    #[test]
+    fn the_first_key_in_a_confirmed_field_keeps_its_confirmation() {
+        fields::set_safe_for_test(Some(true));
+        let mut st = settled();
+        st.control = -1; // focus moved since the last key
+        let before = fields::pokes_for_test();
+        press(&mut st, KEY_A);
+        fields::set_safe_for_test(None);
+        assert_eq!(fields::pokes_for_test(), before, "must not withdraw a valid confirmation");
+        assert_eq!(st.run.len(), 1);
+    }
+
+    #[test]
+    fn an_unconfirmed_new_field_is_checked_once() {
+        fields::set_safe_for_test(Some(false));
+        let mut st = settled();
+        st.control = -1;
+        let before = fields::pokes_for_test();
+        press(&mut st, KEY_A);
+        press(&mut st, KEY_A);
+        fields::set_safe_for_test(None);
+        assert_eq!(fields::pokes_for_test(), before + 1, "repeated checks would never finish while typing");
+    }
+
+    #[test]
+    fn nothing_is_recorded_in_an_unconfirmed_field() {
+        fields::set_safe_for_test(Some(false));
+        let mut st = settled();
+        for key in [KEY_A, KEY_1, KEY_SPACE, KEY_A] {
+            press(&mut st, key);
+        }
+        fields::set_safe_for_test(None);
+        assert!(st.run.is_empty());
+    }
+
+    #[test]
+    fn a_click_on_our_own_popup_keeps_the_text() {
+        let mut st = state();
+        hint_on(&mut st, "sghl ");
+        let rect = RECT { left: 10, top: 10, right: 100, bottom: 40 };
+        if let Some(b) = &mut st.bubble {
+            b.rect = rect;
+        }
+        assert!(st.on_own_popup(POINT { x: 50, y: 20 }));
+        st.on_click(POINT { x: 50, y: 20 });
+        assert_eq!(st.run.len(), 5);
+        assert!(!st.on_own_popup(POINT { x: 500, y: 20 }));
+        st.on_click(POINT { x: 500, y: 20 });
+        assert!(st.run.is_empty());
+    }
+
+    #[test]
+    fn text_is_dropped_the_moment_the_field_stops_being_safe() {
+        fields::set_safe_for_test(Some(true));
+        let mut st = settled();
+        press(&mut st, KEY_A);
+        assert_eq!(st.run.len(), 1);
+        st.auto_fix = Some(AutoFix { start: 0, seq: st.seq, generation: st.generation, at: Instant::now(), typed: Lang::En, candidate: None });
+        fields::set_safe_for_test(Some(false));
+        press(&mut st, KEY_A);
+        fields::set_safe_for_test(None);
+        assert!(st.run.is_empty() && st.auto_fix.is_none());
+    }
+
+    #[test]
+    fn a_word_cut_by_the_gate_is_skipped_until_space() {
+        fields::set_safe_for_test(Some(false));
+        let mut st = settled();
+        press(&mut st, KEY_A);
+        fields::set_safe_for_test(Some(true));
+        press(&mut st, KEY_A);
+        assert!(st.run.is_empty(), "the rest of a half-seen word");
+        press(&mut st, KEY_SPACE);
+        assert!(st.run.is_empty() && !st.skip_word);
+        press(&mut st, KEY_A);
+        fields::set_safe_for_test(None);
+        assert_eq!(st.run.len(), 1);
+    }
+
+    #[test]
+    fn digits_are_never_recorded() {
+        fields::set_safe_for_test(Some(true));
+        let mut st = settled();
+        press(&mut st, KEY_A);
+        press(&mut st, KEY_1);
+        assert!(st.run.is_empty(), "the word it was in goes too");
+        press(&mut st, KEY_1);
+        press(&mut st, KEY_A);
+        assert!(st.run.is_empty());
+        press(&mut st, KEY_SPACE);
+        press(&mut st, KEY_1);
+        fields::set_safe_for_test(None);
+        assert!(st.run.is_empty());
+    }
+
+    #[test]
+    fn right_ctrl_is_not_tracked_in_a_secure_field() {
+        fields::set_safe_for_test(Some(false));
+        let mut st = settled();
+        st.on_key(VK_RCTRL_CODE, 0x1D);
+        fields::set_safe_for_test(None);
+        assert!(!st.rctrl_down && !st.rctrl_alone);
     }
 
     /// Simulates typing `s` with the English layout active.
@@ -1213,6 +2001,236 @@ mod tests {
         assert_eq!(shown(st.evaluate(end, false)).as_deref(), Some("سلام."));
     }
 
+    // ------------------------------------------------------------- spelling ---
+    fn spell_word(typed: &str) -> Option<String> {
+        let mut st = state();
+        type_en(&mut st, typed);
+        let end = st.run.len();
+        st.spell_target(end).map(|(t, _)| t.word)
+    }
+
+    #[test]
+    fn spelling_takes_the_plain_word_before_the_space() {
+        assert_eq!(spell_word("recieve ").as_deref(), Some("recieve"));
+        assert_eq!(spell_word("(recieve), ").as_deref(), Some("recieve"));
+        assert_eq!(spell_word("i recieve ").as_deref(), Some("recieve"));
+        assert_eq!(spell_word("Recieve ").as_deref(), Some("Recieve"));
+        assert_eq!(spell_word("done. Recieve ").as_deref(), Some("Recieve"));
+    }
+
+    #[test]
+    fn spelling_skips_what_is_not_a_plain_word() {
+        for typed in ["recieve", "a@example.com ", "example.com/page ", "abc123 ", "NASA ", "camelCase ", "my Tehran ", "ab "] {
+            assert_eq!(spell_word(typed), None, "{typed}");
+        }
+    }
+
+    #[test]
+    fn spelling_reads_persian_keys() {
+        let mut st = state();
+        for c in "خاهش ".chars() {
+            let c = c.to_string();
+            st.run.push(Key::new(mapping::fa_to_en(&c), c, Lang::Fa));
+        }
+        let end = st.run.len();
+        let (target, other) = st.spell_target(end).unwrap();
+        assert_eq!((target.word.as_str(), other.as_str(), target.lang), ("خاهش", "ohia", Lang::Fa));
+    }
+
+    fn choose(st: &mut State, end: usize, word: &str) {
+        let (target, _) = st.spell_target(end).unwrap();
+        let items = vec![Suggestion { word: word.into(), confidence: 0.9 }];
+        st.spell = Some(SpellChoice { target, items, selected: 0, rect: RECT::default(), navigated: false });
+    }
+
+    #[test]
+    fn accepting_replaces_the_word_and_keeps_later_typing() {
+        let mut st = state();
+        type_en(&mut st, "recieve ");
+        let end = st.run.len();
+        type_en(&mut st, "it");
+        choose(&mut st, end, "receive");
+        match st.accept_spell(false) {
+            Action::Replace { backspaces, text } => assert_eq!((backspaces, text.as_str()), (10, "receive it")),
+            _ => panic!("expected a replacement"),
+        }
+        assert_eq!(st.text_of(0, st.run.len()), "receive it");
+        assert!(st.spell.is_none());
+    }
+
+    #[test]
+    fn a_word_of_another_length_keeps_the_text_in_sync() {
+        let mut st = state();
+        type_en(&mut st, "helllo ");
+        let end = st.run.len();
+        choose(&mut st, end, "hello");
+        assert!(matches!(st.accept_spell(false), Action::Replace { backspaces: 7, .. }));
+        assert_eq!(st.run.len(), 6);
+    }
+
+    fn two_choices(st: &mut State, end: usize) {
+        let (target, _) = st.spell_target(end).unwrap();
+        let items = vec![
+            Suggestion { word: "receive".into(), confidence: 0.9 },
+            Suggestion { word: "relieve".into(), confidence: 0.1 },
+        ];
+        st.spell = Some(SpellChoice { target, items, selected: 0, rect: RECT::default(), navigated: false });
+    }
+
+    #[test]
+    fn arrows_then_space_applies_the_choice_with_one_space() {
+        let mut st = state();
+        type_en(&mut st, "recieve ");
+        let end = st.run.len();
+        two_choices(&mut st, end);
+        st.move_spell(false);
+        assert!(st.spell.as_ref().unwrap().navigated);
+        match st.accept_spell(true) {
+            Action::Replace { backspaces, text } => assert_eq!((backspaces, text.as_str()), (8, "relieve ")),
+            _ => panic!("expected a replacement"),
+        }
+        assert_eq!(st.text_of(0, st.run.len()), "relieve ");
+    }
+
+    #[test]
+    fn space_adds_one_when_more_was_typed_after_the_word() {
+        let mut st = state();
+        type_en(&mut st, "recieve ");
+        let end = st.run.len();
+        two_choices(&mut st, end);
+        type_en(&mut st, "it");
+        match st.accept_spell(true) {
+            Action::Replace { text, .. } => assert_eq!(text, "receive it "),
+            _ => panic!("expected a replacement"),
+        }
+        assert_eq!(st.text_of(0, st.run.len()), "receive it ");
+    }
+
+    #[test]
+    fn hovering_does_not_arm_space() {
+        let mut st = state();
+        type_en(&mut st, "recieve ");
+        let end = st.run.len();
+        two_choices(&mut st, end);
+        st.hover_spell(1);
+        assert!(!st.spell.as_ref().unwrap().navigated);
+    }
+
+    #[test]
+    fn an_edited_word_is_not_replaced() {
+        let mut st = state();
+        type_en(&mut st, "recieve ");
+        let end = st.run.len();
+        choose(&mut st, end, "receive");
+        st.run.truncate(3);
+        assert!(matches!(st.accept_spell(false), Action::HideSpell));
+        assert_eq!(st.run.len(), 3);
+    }
+
+    #[test]
+    fn text_with_a_possible_half_space_is_not_retyped() {
+        let mut st = state();
+        type_en(&mut st, "recieve ");
+        let end = st.run.len();
+        choose(&mut st, end, "receive");
+        type_en(&mut st, "x ");
+        st.spell_barrier = st.run.len();
+        assert!(matches!(st.accept_spell(false), Action::HideSpell));
+    }
+
+    // ------------------------------------------------------------- learning ---
+    fn hint_on(st: &mut State, typed: &str) {
+        type_en(st, typed);
+        let end = st.run.len();
+        let Action::Show { start, target, candidate, .. } = st.evaluate(end, false) else { panic!("no hint") };
+        st.bubble = Some(Bubble { start, target, rect: RECT::default(), caret: RECT::default(), candidate });
+    }
+
+    #[test]
+    fn esc_rejects_a_hint_whose_word_is_untouched() {
+        let mut st = state();
+        hint_on(&mut st, "sghl ");
+        let c = st.rejected_hint(false).unwrap();
+        assert_eq!((c.word.as_str(), c.lang), ("sghl", Lang::En));
+    }
+
+    #[test]
+    fn a_timeout_counts_only_after_typing_on() {
+        let mut st = state();
+        hint_on(&mut st, "sghl ");
+        assert!(st.rejected_hint(true).is_none(), "may never have been seen");
+        type_en(&mut st, "there");
+        assert_eq!(st.rejected_hint(true).unwrap().word, "sghl");
+    }
+
+    #[test]
+    fn fixing_the_word_by_hand_is_not_a_rejection() {
+        let mut st = state();
+        hint_on(&mut st, "sghl ");
+        st.run.truncate(2);
+        type_en(&mut st, "xy ");
+        assert!(st.rejected_hint(false).is_none());
+    }
+
+    #[test]
+    fn a_hint_for_a_phrase_teaches_nothing() {
+        let mut st = state();
+        type_en(&mut st, "di v, n, fh ");
+        let end = st.run.len();
+        let Action::Show { candidate, .. } = st.evaluate(end, false) else { panic!("no hint") };
+        assert!(candidate.is_none());
+    }
+
+    #[test]
+    fn a_rejected_word_is_left_out_of_the_next_hint() {
+        let mut st = state();
+        hint_on(&mut st, "sghl ");
+        st.rejected_hint(false);
+        st.bubble = None;
+        type_en(&mut st, "o,fd ");
+        let end = st.run.len();
+        assert_eq!(shown(st.evaluate(end, false)).as_deref(), Some("خوبی"));
+    }
+
+    fn auto_fixed(st: &mut State) {
+        type_en(st, "sghl ");
+        let candidate = Candidate { start: 0, end: 4, generation: st.generation, lang: Lang::En, word: "sghl".into() };
+        let _ = st.convert_from(0, Lang::Fa);
+        st.auto_fix = Some(AutoFix { start: 0, seq: st.seq, generation: st.generation, at: Instant::now(), typed: Lang::En, candidate: Some(candidate) });
+    }
+
+    #[test]
+    fn the_hotkey_undoes_an_auto_fix_and_rejects_the_word() {
+        let mut st = state();
+        auto_fixed(&mut st);
+        let (action, rejected) = st.on_hotkey();
+        match action {
+            Action::Convert { backspaces, text, .. } => assert_eq!((backspaces, text.as_str()), (5, "sghl ")),
+            _ => panic!("expected the original text back"),
+        }
+        assert_eq!(rejected.unwrap().word, "sghl");
+        assert!(st.run.iter().all(|k| k.kept && k.lang == Lang::En));
+    }
+
+    #[test]
+    fn the_hotkey_is_no_undo_once_typing_went_on() {
+        let mut st = state();
+        auto_fixed(&mut st);
+        st.seq += 1;
+        let (_, rejected) = st.on_hotkey();
+        assert!(rejected.is_none());
+    }
+
+    #[test]
+    fn an_old_auto_fix_cannot_be_undone() {
+        let mut st = state();
+        auto_fixed(&mut st);
+        if let Some(fix) = &mut st.auto_fix {
+            fix.at = Instant::now() - UNDO_WINDOW - Duration::from_secs(1);
+        }
+        assert!(st.fresh_auto_fix().is_none());
+    }
+
     // ------------------------------------------------------------ placement ---
     const SCREEN: RECT = RECT { left: 0, top: 0, right: 1920, bottom: 1040 }; // taskbar below 1040
     const W: i32 = 300;
@@ -1262,11 +2280,13 @@ mod tests {
     }
 
     #[test]
-    fn ding_is_a_valid_wav() {
-        let wav = DING_WAV;
-        assert_eq!(&wav[..4], b"RIFF");
-        assert_eq!(&wav[8..16], b"WAVEfmt ");
-        assert_eq!(u32::from_le_bytes(wav[4..8].try_into().unwrap()) as usize, wav.len() - 8);
+    fn all_sounds_are_valid_wavs() {
+        for wav in [LAYOUT_WAV, TYPO_WAV, FIELD_WAV] {
+            assert_eq!(&wav[..4], b"RIFF");
+            assert_eq!(&wav[8..16], b"WAVEfmt ");
+            assert_eq!(u32::from_le_bytes(wav[4..8].try_into().unwrap()) as usize, wav.len() - 8);
+        }
+        assert_ne!(LAYOUT_WAV, TYPO_WAV);
     }
 }
 
