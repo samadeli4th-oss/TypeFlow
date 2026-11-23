@@ -113,7 +113,7 @@ fn install(quiet: bool) -> Result<(), String> {
         message(
             &format!(
                 "{NAME} {VERSION} is installed and running.\n\nLook for its icon near the clock (it may be \
-                 under the ^ arrow at first). Left click turns hints on or off; right click opens the menu."
+                 under the ^ arrow at first). Left click opens the TypeFlow window; right click opens the menu."
             ),
             MB_ICONINFORMATION,
         );

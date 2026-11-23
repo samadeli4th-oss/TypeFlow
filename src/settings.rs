@@ -7,6 +7,10 @@
 //! auto_fix=false
 //! sound=true
 //! start_with_windows=true
+//! autocorrect_en=false
+//! autocorrect_fa=false
+//! field_action=english
+//! learn_words=false
 //! ```
 //!
 //! Unknown keys and bad values are ignored (the default is used), so the file
@@ -14,17 +18,65 @@
 
 use std::path::PathBuf;
 
+/// What happens when a password or number field gets focus while the keyboard
+/// isn't English.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FieldAction {
+    /// Play the sound and switch the keyboard to English.
+    English = 0,
+    /// Only play the sound.
+    Notify = 1,
+    /// Do nothing.
+    Disable = 2,
+}
+
+impl FieldAction {
+    fn parse(value: &str) -> Option<FieldAction> {
+        match value.to_ascii_lowercase().as_str() {
+            "english" => Some(FieldAction::English),
+            "notify" => Some(FieldAction::Notify),
+            "disable" => Some(FieldAction::Disable),
+            _ => None,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            FieldAction::English => "english",
+            FieldAction::Notify => "notify",
+            FieldAction::Disable => "disable",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Settings {
     pub enabled: bool,
     pub auto_fix: bool,
     pub sound: bool,
     pub start_with_windows: bool,
+    /// Auto-correct for English text.
+    pub autocorrect_en: bool,
+    /// Auto-correct for Persian text.
+    pub autocorrect_fa: bool,
+    /// Password and number fields.
+    pub field_action: FieldAction,
+    /// Treat a word as valid once its hint or auto-fix was rejected 4 times.
+    pub learn_words: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { enabled: true, auto_fix: false, sound: true, start_with_windows: true }
+        Settings {
+            enabled: true,
+            auto_fix: false,
+            sound: true,
+            start_with_windows: true,
+            autocorrect_en: false,
+            autocorrect_fa: false,
+            field_action: FieldAction::English,
+            learn_words: false,
+        }
     }
 }
 
@@ -37,6 +89,12 @@ impl Settings {
                 continue;
             }
             let Some((key, value)) = line.split_once('=') else { continue };
+            if key.trim() == "field_action" {
+                if let Some(action) = FieldAction::parse(value.trim()) {
+                    s.field_action = action;
+                }
+                continue;
+            }
             let value = match value.trim().to_ascii_lowercase().as_str() {
                 "true" | "1" | "yes" | "on" => true,
                 "false" | "0" | "no" | "off" => false,
@@ -47,6 +105,9 @@ impl Settings {
                 "auto_fix" => s.auto_fix = value,
                 "sound" => s.sound = value,
                 "start_with_windows" => s.start_with_windows = value,
+                "autocorrect_en" => s.autocorrect_en = value,
+                "autocorrect_fa" => s.autocorrect_fa = value,
+                "learn_words" => s.learn_words = value,
                 _ => {}
             }
         }
@@ -55,9 +116,17 @@ impl Settings {
 
     pub fn to_text(&self) -> String {
         format!(
-            "# TypeFlow settings (also changed from the tray menu)\n\
-             enabled={}\nauto_fix={}\nsound={}\nstart_with_windows={}\n",
-            self.enabled, self.auto_fix, self.sound, self.start_with_windows
+            "# TypeFlow settings (also changed from the TypeFlow window and tray menu)\n\
+             enabled={}\nauto_fix={}\nsound={}\nstart_with_windows={}\n\
+             autocorrect_en={}\nautocorrect_fa={}\nfield_action={}\nlearn_words={}\n",
+            self.enabled,
+            self.auto_fix,
+            self.sound,
+            self.start_with_windows,
+            self.autocorrect_en,
+            self.autocorrect_fa,
+            self.field_action.name(),
+            self.learn_words
         )
     }
 }
@@ -142,8 +211,41 @@ mod tests {
 
     #[test]
     fn round_trip() {
-        let s = Settings { enabled: false, auto_fix: true, sound: false, start_with_windows: false };
+        let s = Settings {
+            enabled: false,
+            auto_fix: true,
+            sound: false,
+            start_with_windows: false,
+            autocorrect_en: true,
+            autocorrect_fa: false,
+            field_action: FieldAction::Notify,
+            learn_words: true,
+        };
         assert_eq!(Settings::parse(&s.to_text()), s);
+    }
+
+    #[test]
+    fn field_action_has_three_states_and_a_safe_default() {
+        assert_eq!(Settings::default().field_action, FieldAction::English);
+        for (text, want) in [("english", FieldAction::English), ("Notify", FieldAction::Notify), ("disable", FieldAction::Disable)] {
+            assert_eq!(Settings::parse(&format!("field_action={text}\n")).field_action, want);
+        }
+        assert_eq!(Settings::parse("field_action=maybe\n").field_action, FieldAction::English);
+    }
+
+    #[test]
+    fn autocorrect_is_set_per_language_and_off_for_old_files() {
+        let old = Settings::parse("enabled=true\nauto_fix=false\nsound=true\nstart_with_windows=true\n");
+        assert!(!old.autocorrect_en && !old.autocorrect_fa);
+        let fa_only = Settings::parse("autocorrect_fa=true\n");
+        assert!(!fa_only.autocorrect_en && fa_only.autocorrect_fa);
+    }
+
+    #[test]
+    fn learning_is_off_unless_turned_on() {
+        assert!(!Settings::default().learn_words);
+        assert!(!Settings::parse("enabled=true\n").learn_words);
+        assert!(Settings::parse("learn_words=true\n").learn_words);
     }
 
     #[test]

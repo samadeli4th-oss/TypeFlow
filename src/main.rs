@@ -9,13 +9,23 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod detect;
+#[cfg(windows)]
+mod fields;
 mod mapping;
+#[cfg(windows)]
+mod panel;
 mod settings;
+mod spell;
+#[cfg(windows)]
+mod suggest;
 mod theme;
 #[cfg(windows)]
 mod tray;
+mod userwords;
 #[cfg(windows)]
 mod win;
+#[cfg(windows)]
+mod words;
 
 fn main() {
     #[cfg(windows)]
@@ -24,7 +34,7 @@ fn main() {
         detect::lexicons(); // build the dictionaries before the hook starts
         println!("TypeFlow: word lists loaded in {:?}", started.elapsed());
         println!("Type anywhere. Tab = accept hint, Esc = dismiss, Pause or Right Ctrl tap = convert last word.");
-        println!("Tray icon: left click = on/off, right click = menu (Exit).");
+        println!("Tray icon: left click = TypeFlow window, right click = menu (Exit).");
         if let Err(e) = win::run() {
             let text: Vec<u16> = format!("TypeFlow could not start:\n{e}\0").encode_utf16().collect();
             unsafe {
